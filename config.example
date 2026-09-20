@@ -55,6 +55,11 @@ drop_corner=center  # where it sits while dragging: center, top-left,
                   # wheel cancels wherever it is
 drop_ms=130       # how long that takes
 drop_px=10        # movement before a press turns into a drag
+drop_assign=1     # the app is assigned to its workspace before it opens, so
+                  # sway puts it there as it maps. Set 0 if a toolkit comes
+                  # out the wrong size: it then opens on the workspace you
+                  # are on — where it can see the output and its scale — and
+                  # is moved afterwards
 drop_focus=0      # 1 = also switch to that workspace
 drop_close_here=0 # the wheel stays open after every drop, so you can keep
                   # filling workspaces. 1 = close when you drop on the
@@ -69,7 +74,13 @@ overview_debug=0  # 1 = print the conversation with the backdrop to stderr
 
 # --- launching / ordering ---
 # swas logs every app you launch to the history file below and shows the
-# most-recently-opened ones first. This is the default (sort=recent).
+# most-recently-opened ones first. This is the default (center_first=1     # the app you used last sits at the top of the arc, and
+                  # distance from the top is how long ago you used it: second
+                  # to the right, third to the left, fourth to the right, and
+                  # so on. Past the end of the history the rest carry on
+                  # outwards in alphabetical order.
+                  # 0 = fill the arc from the left, oldest layout
+sort=recent).
 sort=recent       # recent = most-recently-opened first (DEFAULT) | alpha = A-Z
 launcher=sh       # sh = run Exec= ; gtk-launch = launch by desktop id
 terminal=xterm    # used for Terminal=true entries when launcher=sh

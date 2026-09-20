@@ -14,8 +14,9 @@ Debian trixie and newer:
 ```sh
 sudo apt install build-essential pkg-config libsdl3-dev
 make
-make install          # ~/.local/bin, or PREFIX=/usr/local
+sudo make install     # /usr/bin, examples in /usr/share/swas
 make config           # optional: write a default config to ~/.config/swas/config
+make link             # or: config -> the installed example, kept in sync
 ```
 
 `make static` bakes SDL3 into the binary, so it runs without `libSDL3.so`. It
@@ -44,15 +45,31 @@ for_window [app_id="swas"] floating enable, border none
 | `esc` | clear the filter, else quit |
 | right click | quit |
 
-Apps are read from the `.desktop` files in the usual directories. The wheel
-shows the most recently opened ones first; every launch is written to
-`~/.cache/swas/history`.
+Apps are read from the `.desktop` files in the usual directories. The one you
+used last sits at the top of the arc, under the pointer, and distance from the
+top is how long ago you used it — second to the right, third to the left,
+fourth to the right, and so on. Past the end of the history the rest carry on
+outwards in alphabetical order:
+
+```
+history: firefox foot code gimp mpv, then the alphabet
+
+darktable  blender  mpv  code  [firefox]  foot  gimp  ardour  calibre
+```
+
+`center_first=0` fills the arc from the left instead. Every launch is written
+to `~/.cache/swas/history`.
 
 ```sh
 swas --list                       # every id, name and resolved icon
 swas include=firefox,code,gimp    # a curated wheel, in that order
 swas --dmenu < items              # a dmenu-style picker on stdin/stdout
 ```
+
+In scripts written for dmenu or bemenu, `MENU=swas` works as it is: dmenu's own
+flags (`-l 10`, `-p ""`, `-i`, ...) switch on dmenu mode and are otherwise
+ignored. Blank lines in the input are skipped. Cancelling exits non-zero, like
+dmenu.
 
 ## Drop onto a workspace
 
@@ -69,6 +86,19 @@ while you hover there. `esc` and right click cancel too.
 While it is small it sits on a disc of its own (`drop_bg`), so it keeps an
 edge against a busy overview instead of reading as a handful of loose marks.
 
+When an app does not appear, swas says so under the wheel for a few seconds:
+`could not start Firefox` if the launch itself failed, `Firefox did not start`
+if the process was gone a second and a half later — a typo in a `.desktop`
+file, a missing binary, something that exits on startup. It stays quiet for
+anything that is merely slow.
+
+`drop_assign=0` opens the app on the workspace you are on and moves it after,
+instead of assigning it first. Assigning is tidier — sway puts the window
+straight where it belongs — but it means the app maps on a workspace that is
+not on screen, and a toolkit that reads its scale from the output it lands on
+has no output to read. GTK and WebKit do that, and come out at scale 1 on a
+scaled screen, which looks like everything is too big.
+
 `drop_size` is that width in pixels, which is what you actually want to say
 rather than a fraction of a screen you have to work out; `drop_size=0` falls
 back to `drop_shrink` as a fraction. `drop_corner` moves it out of the middle
@@ -83,7 +113,7 @@ sway makes it.
 underneath, showing every workspace with the windows already in it.
 
 ```
-bindsym $mod+space exec swas overview=1
+bindsym $mod+space exec swas --replace overview=1
 
 no_focus [app_id="swov-backdrop"]
 for_window [app_id="swov-backdrop"] floating enable, border none
@@ -98,6 +128,14 @@ new ones are absent, so nothing is lost by not moving them.
 `no_focus` is a command in its own right and takes the criteria as its
 argument — it is *not* something you put after `for_window`. Written the wrong
 way round it fails silently at load and the backdrop takes your keyboard.
+
+Started by swov (its `d` key), swas talks to that overview instead of
+bringing up its own: the wheel appears in front of it, and closes again after
+one drop, leaving the overview where it was. That is what `SWAS_OV_IN` and
+`SWAS_OV_OUT` in the environment mean.
+
+`--replace` closes a wheel that is already open before starting, so pressing
+the binding twice gives you one wheel rather than two stacked on each other.
 
 The `no_focus` line matters. Without it sway hands the keyboard to the backdrop
 the moment it appears and the first letters you type are lost.
@@ -146,6 +184,11 @@ This needs swov on `PATH`: swas asks it for the
 workspace list and hands it the launched process, which swov follows until its
 window appears and then moves. Without swov the feature is simply off. Set
 `drop_focus=1` to follow the app to its workspace instead of staying put.
+
+`make install` also drops the shipped examples in `/usr/share/swas/`.
+`make link` points your config at one of them, so the next install is the
+config you are running — handy if you want to follow the examples rather than
+keep your own copy. Edits you make there are overwritten on install.
 
 ## Config
 

@@ -136,10 +136,14 @@ typedef struct {
     char  sort[16], launcher[16], terminal[128];
     char  history[PATH_MAX], dirs[4096], include[8192], exclude[8192];
     int   drop;                       /* drag an app onto a workspace: 0 = off */
+    int   center_first;               /* the most recent app at the top, the
+                                         rest spreading either side of it     */
     int   overview;                   /* 1 = swov behind the wheel as the target */
     int   overview_debug;             /* narrate the backdrop conversation      */
     float drop_shrink;                /* how small the wheel gets while dragging */
     int   drop_ms, drop_px, drop_focus;
+    int   drop_assign;                /* assign the pid before the app opens,
+                                         or let it open here and move it     */
     int   drop_close_here;            /* dropped on the workspace we are on:
                                          close, or the app opens behind us   */
     char  drop_corner[16];            /* where the wheel sits while dragging:
@@ -175,8 +179,8 @@ static void config_defaults(Config*c){
     c->label_px=24; c->title_px=25; c->search_px=20; c->count_px=20;
     c->ssaa=2;
     c->animate=1; c->anim_ms=90; c->recent_first=1;
-    c->drop=1; c->drop_shrink=0.55f; c->drop_ms=130; c->drop_px=10; c->drop_focus=0;
-    c->overview=0; c->overview_debug=0; c->drop_close_here=0;
+    c->drop=1; c->drop_shrink=0.55f; c->drop_ms=130; c->drop_px=10; c->drop_assign=1; c->drop_focus=0;
+    c->center_first=1; c->overview=0; c->overview_debug=0; c->drop_close_here=0;
     strcpy(c->drop_corner,"center"); c->drop_size=66;
     strcpy(c->swov,"swov");
     strcpy(c->sort,"recent"); strcpy(c->launcher,"sh");
@@ -218,6 +222,7 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"anim_ms"))c->anim_ms=atoi(v);
     else if(!strcmp(k,"recent_first"))c->recent_first=atoi(v);
     else if(!strcmp(k,"drop"))c->drop=atoi(v);
+    else if(!strcmp(k,"center_first"))c->center_first=atoi(v);
     else if(!strcmp(k,"overview"))c->overview=atoi(v);
     else if(!strcmp(k,"overview_debug"))c->overview_debug=atoi(v);
     else if(!strcmp(k,"drop_close_here"))c->drop_close_here=atoi(v);
@@ -227,6 +232,7 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"drop_shrink"))c->drop_shrink=(float)atof(v);
     else if(!strcmp(k,"drop_ms"))c->drop_ms=atoi(v);
     else if(!strcmp(k,"drop_px"))c->drop_px=atoi(v);
+    else if(!strcmp(k,"drop_assign"))c->drop_assign=atoi(v);
     else if(!strcmp(k,"drop_focus"))c->drop_focus=atoi(v);
     else if(!strcmp(k,"swov"))snprintf(c->swov,sizeof c->swov,"%s",v);
     else if(!strcmp(k,"font"))snprintf(c->font,sizeof c->font,"%s",v);
@@ -588,11 +594,41 @@ static int match_cmp(const void*a,const void*b){
     if(x->len !=y->len ) return x->len -y->len;         /* shorter (closer) first */
     return x->idx-y->idx;                               /* then recency order */
 }
-static int build_filter(AppList*apps,const char*query,int*filt,int slots,int recent_first,int*p_off,int*p_selslot){
+static int build_filter(AppList*apps,const char*query,int*filt,int slots,int recent_first,int center_first,int*p_off,int*p_selslot){
     int fn=0;
-    if(!query[0]){                                      /* no query: all apps, in order */
+    if(!query[0]){
+        /* No query: the same shape a search gives, with recency standing in
+           for the ranking. The one you used last sits at the top, the next
+           few to its right, and the rest carry on round to its left — so the
+           further from the top an app is, the longer since you opened it. */
         for(int i=0;i<apps->n;i++) filt[fn++]=i;
-        *p_off=0; *p_selslot=0; return fn;
+        if(fn<1){ *p_off=0; *p_selslot=0; return 0; }
+        if(!center_first){ *p_off=0; *p_selslot=0; return fn; }
+
+        /* Distance from the top is how long ago you used it: second to the
+           right, third to the left, fourth to the right, and so on. The list
+           is already history first and then everything else by name, so once
+           the history runs out the alphabet simply carries on outwards. When
+           one side fills up the rest goes on the other. */
+        int c=(fn-1)/2, rank=1;
+        int *tmp=malloc((size_t)fn*sizeof(int));
+        if(!tmp){ *p_off=0; *p_selslot=0; return fn; }
+        tmp[c]=filt[0];
+        for(int r=c+1, l=c-1; rank<fn; ){
+            if(r<fn  && rank<fn) tmp[r++]=filt[rank++];
+            if(l>=0  && rank<fn) tmp[l--]=filt[rank++];
+            if(r>=fn && l<0) break;
+        }
+        memcpy(filt,tmp,(size_t)fn*sizeof(int));
+        free(tmp);
+
+        int vis = fn<slots?fn:slots; if(vis<1)vis=1;
+        if(vis>=4 && (vis&1)==0) vis--;                 /* odd: dead centre */
+        int maxoff = fn>vis?fn-vis:0;
+        int off = c-(vis-1)/2; if(off<0)off=0; if(off>maxoff)off=maxoff;
+        int ss = c-off; if(ss<0)ss=0; if(ss>vis-1)ss=vis-1;
+        *p_off=off; *p_selslot=ss;
+        return fn;
     }
     size_t ql=strlen(query);
     Match *m=malloc(apps->n*sizeof(Match)); int nm=0;
@@ -837,6 +873,60 @@ static void ov_send(const char*fmt,...){
     }
 }
 
+/* Take over from a wheel that is already up.
+ *
+ * Two of these on top of each other is confusing and the second one grabs the
+ * keyboard, so the binding should just open the one that is there. Same
+ * approach as swbr: clear the way rather than race a pkill. */
+static void replace_running(void){
+    DIR*d=opendir("/proc"); if(!d) return;
+    pid_t me=getpid(), victims[32]; int n=0;
+    struct dirent*e;
+    while((e=readdir(d))&&n<(int)(sizeof victims/sizeof*victims)){
+        bool digits=e->d_name[0]!=0;
+        for(const char*q=e->d_name;*q;q++) if(*q<'0'||*q>'9'){digits=false;break;}
+        if(!digits) continue;
+        pid_t pid=(pid_t)atoi(e->d_name);
+        if(pid==me||pid<=1) continue;
+        char path[64],comm[64]="";
+        snprintf(path,sizeof path,"/proc/%d/comm",(int)pid);
+        FILE*f=fopen(path,"r"); if(!f) continue;
+        if(fgets(comm,sizeof comm,f)){ char*nl=strchr(comm,'\n'); if(nl)*nl=0; }
+        fclose(f);
+        if(strcmp(comm,APP_ID)) continue;
+        struct stat st; snprintf(path,sizeof path,"/proc/%d",(int)pid);
+        if(stat(path,&st)!=0||st.st_uid!=getuid()) continue;
+        victims[n++]=pid;
+    }
+    closedir(d);
+    for(int i=0;i<n;i++) kill(victims[i],SIGTERM);
+    for(int w=0;w<40&&n;w++){
+        usleep(50000);
+        int left=0;
+        for(int i=0;i<n;i++) if(kill(victims[i],0)==0) victims[left++]=victims[i];
+        n=left;
+    }
+    for(int i=0;i<n;i++) kill(victims[i],SIGKILL);
+}
+
+static int OV_ONCE=0;   /* launched by an overview: close after one drop */
+
+/* Started by an overview that is already up: it hands us two pipes and stays
+   where it is, so the wheel appears in front of the overview instead of
+   replacing it. One drag, one drop, and we are gone again. */
+static int ov_adopt(void){
+    const char*i=getenv("SWAS_OV_IN"), *o=getenv("SWAS_OV_OUT");
+    if(!i||!*i||!o||!*o) return 0;
+    int rd=atoi(i), wr=atoi(o);      /* what swov gave us: read, write */
+    if(rd<=0||wr<=0) return 0;
+    signal(SIGPIPE,SIG_IGN);
+    OV_OUT=rd;                       /* we read its replies here */
+    OV_IN =wr;                       /* and send it commands here */
+    fcntl(OV_OUT,F_SETFL,O_NONBLOCK);
+    OV_ONCE=1;
+    return 1;
+}
+
 static void ov_spawn(Config*c){
     OV_LOG=c->overview_debug;
     int to[2], from[2];
@@ -926,8 +1016,14 @@ static void adopt_to(Config*c,pid_t pid,const char*target,
     if(p==0){
         int fd=open("/dev/null",O_RDWR);
         if(fd>=0){ dup2(fd,0); dup2(fd,1); dup2(fd,2); if(fd>2) close(fd); }
-        const char*av[12]; int n=0;
+        const char*av[14]; int n=0;
         av[n++]=c->swov; av[n++]="--adopt"; av[n++]=spid; av[n++]=target;
+        /* Assigning the app to a workspace before it opens means it maps on
+           one that is not on screen. A toolkit that picks its scale from the
+           output it lands on has no output to look at, takes 1, and comes out
+           the wrong size on a scaled screen. Without the rule it opens here,
+           at the right scale, and is moved after. */
+        if(!c->drop_assign) av[n++]="--no-assign";
         if(edge&&*edge){
             if(beside&&*beside){ av[n++]="--beside"; av[n++]=beside; }
             av[n++]="--edge"; av[n++]=edge;
@@ -946,6 +1042,38 @@ static void wsp_adopt(Config*c,pid_t pid,const Wsp*w){
     if(w->num>=0) snprintf(target,sizeof target,"%d",w->num);
     else          snprintf(target,sizeof target,"%s",w->name);
     adopt_to(c,pid,target,NULL,NULL);
+}
+
+/* Something to say when an app does not appear.
+ *
+ * A launcher that silently does nothing is the worst kind: you press, nothing
+ * happens, and there is no way to tell a typo in a .desktop file from a slow
+ * program. The pid is watched for a moment after launching, and if it is
+ * gone by then the app never really started. */
+static char  ERR_TEXT[192];
+static double ERR_UNTIL;
+static pid_t  WATCH_PID;
+static double WATCH_AT;
+static char   WATCH_NAME[64];
+
+static double now_secs_(void){ return (double)SDL_GetTicks()/1000.0; }
+
+static void err_say(const char*fmt,...){
+    va_list ap; va_start(ap,fmt);
+    vsnprintf(ERR_TEXT,sizeof ERR_TEXT,fmt,ap);
+    va_end(ap);
+    ERR_UNTIL = now_secs_() + 6.0;
+}
+
+static void watch_tick(void){
+    if(!WATCH_PID) return;
+    if(now_secs_() - WATCH_AT < 1.5) return;
+
+    char path[64];
+    snprintf(path,sizeof path,"/proc/%d",(int)WATCH_PID);
+    if(access(path,F_OK)!=0)
+        err_say("%s did not start", WATCH_NAME);
+    WATCH_PID=0;
 }
 
 static pid_t launch(App*a,Config*c){
@@ -977,7 +1105,10 @@ static pid_t launch(App*a,Config*c){
         if(pfd[1]>=0){
             pid_t me=getpid();
             if(write(pfd[1],&me,sizeof me)<0){}
-            close(pfd[1]);
+            /* Kept open across the exec, so that if the exec fails this end
+               closes and the reader learns the app never started. On success
+               it is closed by the exec itself. */
+            fcntl(pfd[1],F_SETFD,FD_CLOEXEC);
         }
         int fd=open("/dev/null",O_RDWR);
         if(fd>=0){ dup2(fd,0); dup2(fd,1); dup2(fd,2); if(fd>2) close(fd); }
@@ -992,6 +1123,14 @@ static pid_t launch(App*a,Config*c){
     if(pfd[0]>=0){
         if(read(pfd[0],&app,sizeof app)!=(ssize_t)sizeof app) app=-1;
         close(pfd[0]);
+    }
+
+    if(app<=0){
+        err_say("could not start %s", (a->name&&a->name[0])?a->name:a->id);
+    } else {
+        WATCH_PID = app;
+        WATCH_AT  = now_secs_();
+        snprintf(WATCH_NAME,sizeof WATCH_NAME,"%s", (a->name&&a->name[0])?a->name:a->id);
     }
     return app;
 }
@@ -1133,6 +1272,10 @@ static void dump_config(void){
 "                 # not get lost over the overview. Alpha 0 for none\n"
 "drop_ms=130      # how long that takes\n"
 "drop_px=10       # movement before a press turns into a drag\n"
+"drop_assign=1    # assign the app to its workspace before it opens. 0 =\n"
+"                 # let it open on the workspace you are on and move it\n"
+"                 # after, which is what a toolkit that reads its scale from\n"
+"                 # the output it lands on needs\n"
 "drop_focus=0     # 1 = also switch to that workspace\n"
 "drop_close_here=0  # dropping on the workspace you are on keeps the wheel\n"
 "                 # open too; 1 = close, so the new window is not behind it\n"
@@ -1141,6 +1284,9 @@ static void dump_config(void){
 "# --- launching / ordering ---\n"
 "# swas logs every app you launch to the history file below and shows the\n"
 "# most-recently-opened ones first. This is the default (sort=recent).\n"
+"center_first=1   # the app you used last at the top of the arc, second to\n"
+"                 # its right, third to its left, and so on outwards; then\n"
+"                 # the rest alphabetically. 0 = fill from the left\n"
 "sort=recent       # recent = most-recently-opened first (DEFAULT) | alpha = A-Z\n"
 "launcher=sh       # sh = run Exec= ; gtk-launch = launch by desktop id\n"
 "terminal=xterm    # used for Terminal=true entries when launcher=sh\n"
@@ -1185,9 +1331,12 @@ static void usage(const char*a0){
 "      --list          print discovered apps (with resolved icon) and exit\n"
 "      --no-recent     rank matches purely by relevance, ignoring recent-app bias\n"
 "  -d, --dmenu         read newline-separated items from stdin, print the chosen\n"
-"                      one to stdout (a dmenu/bemenu/wofi-style picker)\n"
+"                      one to stdout (a dmenu/bemenu/wofi-style picker). dmenu's\n"
+"                      own flags (-l N, -p PROMPT, -i, ...) imply it and are\n"
+"                      otherwise ignored, so MENU=swas works in dmenu scripts\n"
 "  -h, --help          show this help and exit\n"
 "  -v, --version       print the version and build id, and exit\n"
+"      --replace       close a wheel that is already open, then start\n"
 "\n"
 "LAYOUT / INTERACTION\n"
 "  slots=11            wide, easy-to-hit app slots across the top arc\n"
@@ -1276,6 +1425,8 @@ static void load_apps(AppList*apps, Config*cfg, int dmenu){
         while(fgets(line,sizeof line,stdin)){
             size_t L=strlen(line);
             while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
+            if(!L) continue;               /* a blank line is a gap in a list,
+                                              not an empty slice on the wheel */
             App a; memset(&a,0,sizeof a);
             a.id=xstrdup(line); a.name=xstrdup(line);
             applist_push(apps,a);                  /* input order preserved */
@@ -1290,29 +1441,48 @@ static void load_apps(AppList*apps, Config*cfg, int dmenu){
     if(!dmenu){ apply_config_order(apps,cfg); apply_recency(apps,cfg); }
 }
 
+/* dmenu's own flags. A script written for dmenu or bemenu calls the menu with
+   -l 10 -p "" and the like, and used to get the app wheel: the flags were
+   ignored, the pick was launched instead of printed, and the script got an
+   empty answer. Any of these now means dmenu mode. Returns how many argv
+   entries the flag takes, or 0 if it is not one of them. */
+static int dmenu_flag(const char*a){
+    static const char*with_arg[]={"-l","-p","-P","-fn","-nb","-nf","-sb","-sf",
+                                  "-m","-w","-W","--prompt","--lines","--fn",0};
+    static const char*bare[]={"-i","-b","-f","-n","--ignorecase",0};
+    for(int k=0;with_arg[k];k++) if(!strcmp(a,with_arg[k])) return 2;
+    for(int k=0;bare[k];k++) if(!strcmp(a,bare[k])) return 1;
+    return 0;
+}
+
 int main(int argc,char**argv){
     Config cfg; config_defaults(&cfg);
     char cfgpath[PATH_MAX];
     
     xdg_path(cfgpath,sizeof cfgpath,"XDG_CONFIG_HOME",".config","config");
 
-    int want_list=0, dmenu=0;
+    int want_list=0, dmenu=0, do_replace=0;
     for(int i=1;i<argc;i++){
         if((!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config"))&&i+1<argc)
             snprintf(cfgpath,sizeof cfgpath,"%s",argv[++i]);
         else if(!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")){ usage(argv[0]); return 0; }
+        else if(!strcmp(argv[i],"--replace")){ do_replace=1; }
         else if(!strcmp(argv[i],"-v")||!strcmp(argv[i],"--version")){
             printf("swas %s (build %s)\n",SWAS_VERSION,SWAS_BUILD); return 0; }
         else if(!strcmp(argv[i],"--dump-config")){ dump_config(); return 0; }
         else if(!strcmp(argv[i],"--list")) want_list=1;
         else if(!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")) dmenu=1;
+        else if(dmenu_flag(argv[i])){ dmenu=1; i+=dmenu_flag(argv[i])-1; }
     }
     { char tmp[PATH_MAX]; expand_tilde(cfgpath,tmp,sizeof tmp); snprintf(cfgpath,sizeof cfgpath,"%s",tmp); }
+    if(do_replace) replace_running();   /* one wheel at a time */
+
     sw_shared_apply("swas",config_set_shared,&cfg);   /* shared first */
     config_load(&cfg,cfgpath);                            /* our own wins  */
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config")){ i++; continue; }
-        if(!strcmp(argv[i],"--list")||!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")||!strcmp(argv[i],"--dump-config")||!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")||!strcmp(argv[i],"-v")||!strcmp(argv[i],"--version")) continue;
+        if(!strcmp(argv[i],"--list")||!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")||!strcmp(argv[i],"--dump-config")||!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")||!strcmp(argv[i],"-v")||!strcmp(argv[i],"--version")||!strcmp(argv[i],"--replace")) continue;
+        if(dmenu_flag(argv[i])){ i+=dmenu_flag(argv[i])-1; continue; }   /* and its value */
         if(!strcmp(argv[i],"--no-recent")||!strcmp(argv[i],"--all-apps")){ cfg.recent_first=0; continue; }
         char*a=argv[i]; while(*a=='-') a++;            /* accept --key=value too */
         char*eq=strchr(a,'='); if(eq){ *eq='\0'; config_set(&cfg,a,eq+1); }
@@ -1398,7 +1568,7 @@ int main(int argc,char**argv){
     #define REBUILD() do{ \
         memcpy(snap_item,last_item,sizeof(int)*last_n); memcpy(snap_ang,last_ang,sizeof(float)*last_n); \
         snap_n=last_n; snap_sel=last_sel; \
-        fn=build_filter(&apps,query,filt,cfg.slots,cfg.recent_first,&off,&selslot); anim0=SDL_GetTicks(); }while(0)
+        fn=build_filter(&apps,query,filt,cfg.slots,cfg.recent_first,cfg.center_first,&off,&selslot); anim0=SDL_GetTicks(); }while(0)
     REBUILD();
 
     /* --- drag an app out of the wheel and onto a workspace ---
@@ -1558,7 +1728,13 @@ int main(int argc,char**argv){
                 if(press_down && !dragging && cfg.drop && press_item>=0){
                     float dx=mx-press_x, dy=my-press_y;
                     if(dx*dx+dy*dy > (float)(cfg.drop_px*cfg.drop_px)){
-                        if(OV_READY){ dragging=1; ov_send("drag on"); }
+                        if(OV_READY){
+                            dragging=1;
+                            ov_send("drag on");
+                            /* the app on the pointer is drawn on this
+                               surface, so it has to be the one in front */
+                            ov_send("raise " APP_ID);
+                        }
                         else {
                             wsp_load(&cfg);      /* first drag pays for the list */
                             if(NWSP>0) dragging=1; else press_item=-1;
@@ -1649,7 +1825,8 @@ int main(int argc,char**argv){
                                 adopt_to(&cfg,p,OV_TARGET,OV_BESIDE,OV_EDGE);
                                 /* the new window takes the focus as it opens;
                                    the wheel is meant to stay in front of it */
-                                if(OV_HERE && cfg.drop_close_here) running=0;
+                                if(OV_ONCE) running=0;     /* one go */
+                                else if(OV_HERE && cfg.drop_close_here) running=0;
                                 else ov_send("raise " APP_ID);
                             }
                             ov_send("drag off");
@@ -1866,6 +2043,26 @@ int main(int argc,char**argv){
             text_centered(ren,&font,mx,my+isz*0.72f,cfg.label_px*ui,cfg.text,cut);
         }
 
+        /* Whatever went wrong, said plainly under the wheel. */
+        watch_tick();
+        if(ERR_TEXT[0] && now_secs_() < ERR_UNTIL){
+            float a=(float)(ERR_UNTIL-now_secs_());
+            if(a>1.0f) a=1.0f;
+            Col ec=cfg.hl; ec.a=(Uint8)(255*a);
+            Col bgc=cfg.center; bgc.a=(Uint8)(bgc.a*a);
+            char cut[200];
+            fit_label(&font,cfg.label_px*ui,ERR_TEXT,(float)w*0.7f,cut,sizeof cut);
+            float tw=text_width(&font,cfg.label_px*ui,cut);
+            float pad=14.0f*ui, bh=cfg.label_px*ui+pad;
+            SDL_FRect box={(float)w*0.5f-tw*0.5f-pad, cy+R+40.0f*ui, tw+2*pad, bh};
+            SDL_SetRenderDrawColor(ren,bgc.r,bgc.g,bgc.b,bgc.a);
+            SDL_RenderFillRect(ren,&box);
+            text_centered(ren,&font,(float)w*0.5f,box.y+bh*0.5f+cfg.label_px*ui*0.35f,
+                          cfg.label_px*ui,ec,cut);
+        } else if(ERR_TEXT[0] && now_secs_() >= ERR_UNTIL) {
+            ERR_TEXT[0]=0;
+        }
+
         if(ss>1 && target){
             SDL_SetRenderScale(ren,1,1);
             SDL_SetRenderTarget(ren,NULL);
@@ -1875,9 +2072,11 @@ int main(int argc,char**argv){
         }
         SDL_RenderPresent(ren);
 
-        if(!ov_started && cfg.overview && cfg.drop){
+        if(!ov_started && cfg.drop){
             ov_started=1;             /* only now: the wheel is already up */
-            ov_spawn(&cfg);
+            /* an overview that started us is already there; otherwise bring
+               one up ourselves, if we were asked to */
+            if(!ov_adopt() && cfg.overview) ov_spawn(&cfg);
         }
         SDL_Delay(16);
     }
