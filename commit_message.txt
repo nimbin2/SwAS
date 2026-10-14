@@ -1,0 +1,17 @@
+swas: scale an oversized SVG icon instead of cropping it
+
+Icons were rasterised to the width and height the SVG declares, so anything
+drawn outside that box was simply not drawn. The box is now the declared
+canvas and the shapes' own bounds together: an icon with deliberate padding
+keeps it, one whose art overflows its own width/height is scaled down rather
+than losing an edge. Stroke width is counted in, since a stroke sits astride
+its path.
+
+Checked against a 48x48 icon whose art reaches 88x88: ink running into the
+bottom and right edges drops from 54 pixels to 9, and well-formed icons
+rasterise byte for byte as before.
+
+Also in this release: dmenu's own flags (-l N, -p PROMPT, -i, ...) now switch
+on dmenu mode and are otherwise ignored, so MENU=swas works unchanged in
+scripts written for dmenu or bemenu. Blank lines in the input are skipped
+rather than becoming empty slices on the wheel.

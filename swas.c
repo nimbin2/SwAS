@@ -725,20 +725,36 @@ static int ends_with_ci(const char*s,const char*suf){
     size_t ls=strlen(s),lf=strlen(suf);
     return ls>=lf && strcasecmp(s+ls-lf,suf)==0;
 }
-/* rasterise an SVG icon to a texture at ~px pixels (aspect preserved) */
+/* Rasterise an SVG icon to ~px pixels, aspect preserved and nothing cut off.
+   Scaling by the declared width/height alone crops any icon whose drawing runs
+   outside it — a viewBox that does not cover the art, or none at all — because
+   the rasteriser simply does not draw past the box it is given. The box used
+   here is the declared canvas and the shapes' own bounds together: an icon
+   with deliberate padding keeps it, one that overflows is scaled down instead
+   of losing an edge. */
 static SDL_Texture *load_svg_tex(SDL_Renderer*ren,const char*path,int px){
     if(px<16)px=16; if(px>512)px=512;
     NSVGimage*img=nsvgParseFromFile(path,"px",96.0f);
     if(!img) return NULL;
-    if(img->width<=0||img->height<=0){ nsvgDelete(img); return NULL; }
-    float big=img->width>img->height?img->width:img->height;
-    float sc=(float)px/big;
-    int ow=(int)(img->width*sc+0.5f), oh=(int)(img->height*sc+0.5f);
+    float x0=0,y0=0,x1=img->width,y1=img->height;
+    if(x1<=0||y1<=0){ x0=y0=1e30f; x1=y1=-1e30f; }   /* no usable canvas */
+    for(NSVGshape*s=img->shapes;s;s=s->next){
+        if(!(s->flags&NSVG_FLAGS_VISIBLE)) continue;
+        float m=s->strokeWidth*0.5f;                 /* a stroke sits astride */
+        if(s->bounds[0]-m<x0) x0=s->bounds[0]-m;
+        if(s->bounds[1]-m<y0) y0=s->bounds[1]-m;
+        if(s->bounds[2]+m>x1) x1=s->bounds[2]+m;
+        if(s->bounds[3]+m>y1) y1=s->bounds[3]+m;
+    }
+    float bw=x1-x0, bh=y1-y0;
+    if(!(bw>0.0f)||!(bh>0.0f)){ nsvgDelete(img); return NULL; }
+    float sc=(float)px/(bw>bh?bw:bh);
+    int ow=(int)(bw*sc+0.5f), oh=(int)(bh*sc+0.5f);
     if(ow<1)ow=1; if(oh<1)oh=1;
-    unsigned char*pix=malloc((size_t)ow*oh*4);
+    unsigned char*pix=calloc((size_t)ow*oh,4);
     NSVGrasterizer*r=nsvgCreateRasterizer();
     if(!pix||!r){ free(pix); if(r)nsvgDeleteRasterizer(r); nsvgDelete(img); return NULL; }
-    nsvgRasterize(r,img,0,0,sc,pix,ow,oh,ow*4);
+    nsvgRasterize(r,img,-x0*sc,-y0*sc,sc,pix,ow,oh,ow*4);
     nsvgDeleteRasterizer(r); nsvgDelete(img);
     SDL_Surface*s=SDL_CreateSurfaceFrom(ow,oh,SDL_PIXELFORMAT_ABGR8888,pix,ow*4);
     if(!s){ free(pix); return NULL; }
