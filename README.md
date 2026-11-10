@@ -31,7 +31,6 @@ labwc and the other wlroots compositors do.
 
 ```
 bindsym $mod+space exec swas
-for_window [app_id="swas"] floating enable, border none
 ```
 
 | key | action |
@@ -114,20 +113,19 @@ underneath, showing every workspace with the windows already in it.
 
 ```
 bindsym $mod+space exec swas --replace overview=1
-
-no_focus [app_id="swov-backdrop"]
-for_window [app_id="swov-backdrop"] floating enable, border none
-for_window [app_id="swas"] floating enable, border none
 ```
 
-The app id changed with the name, so any rule of yours saying `app_id="appwheel"`
-needs updating. The config and history move too — `~/.config/swas/config` and
-`~/.cache/swas/history` — but the old `appwheel` ones are still read when the
-new ones are absent, so nothing is lost by not moving them.
+That is the whole config. Both programs are layer-shell surfaces, not
+windows, so the old `for_window` and `no_focus` rules for `swas` and
+`swov-backdrop` do nothing and can be deleted.
 
-`no_focus` is a command in its own right and takes the criteria as its
-argument — it is *not* something you put after `for_window`. Written the wrong
-way round it fails silently at load and the backdrop takes your keyboard.
+The overview is not started when the wheel opens. It comes up the moment you
+start dragging an app, which is the only time it is of any use — so pressing
+the binding costs one process, not two.
+
+The config and history live in `~/.config/swas/config` and
+`~/.cache/swas/history`; the old `appwheel` ones are still read when those
+are absent, so nothing is lost by not moving them.
 
 Started by swov (its `d` key), swas talks to that overview instead of
 bringing up its own: the wheel appears in front of it, and closes again after
@@ -137,16 +135,11 @@ one drop, leaving the overview where it was. That is what `SWAS_OV_IN` and
 `--replace` closes a wheel that is already open before starting, so pressing
 the binding twice gives you one wheel rather than two stacked on each other.
 
-The `no_focus` line matters. Without it sway hands the keyboard to the backdrop
-the moment it appears and the first letters you type are lost.
-
 If something looks wrong, run it from a terminal with `overview_debug=1`:
 every line between the two, and swov's own complaints, go to stderr.
 
-The backdrop maps on top of the wheel — on Wayland a window cannot lift itself
-back — so swas asks swov to restack it as soon as that window is up. If
-you ever end up with a wheel that ignores the mouse, that is what went wrong;
-`esc` still closes it, and `overview=0` falls back to the plain tiles.
+The backdrop sits on the layer below the wheel, so the wheel stays in front
+and keeps the keyboard. `overview=0` falls back to the plain tiles.
 
 Drop it against the **edge of a workspace** and it opens beside everything
 already there — left of a column of two windows, not left of the top one.
@@ -255,3 +248,5 @@ that.
 - Apps whose `.desktop` file says `Terminal=true` are run inside `terminal=`.
 - SVG icons are rasterised at the size they are drawn, so they stay sharp at
   any `icon_px`.
+- A frame is only drawn when something changes or something is still moving.
+  An open wheel sitting still uses no CPU.

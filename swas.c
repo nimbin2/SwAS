@@ -57,7 +57,7 @@ typedef struct { float x,y,w,h; } Rect;
 
 #define APP_ID "swas"          /* wayland app_id / X11 WM_CLASS */
 
-#define SWAS_VERSION "1.3"
+#define SWAS_VERSION "1.3.1"
 #ifndef SWAS_BUILD             /* set by the Makefile: md5 of this file */
 #define SWAS_BUILD "unknown"
 #endif
@@ -883,6 +883,11 @@ static int ov_adopt(void){
     return 1;
 }
 
+static uint64_t now_ms_(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (uint64_t)ts.tv_sec*1000u + (uint64_t)(ts.tv_nsec/1000000);
+}
+
 static void ov_spawn(Config*c){
     OV_LOG=c->overview_debug;
     int to[2], from[2];
@@ -906,6 +911,29 @@ static void ov_spawn(Config*c){
     fcntl(OV_OUT,F_SETFL,O_NONBLOCK);
 }
 
+static void ov_poll(void);
+
+/* The overview is only wanted once an app is actually being dragged
+   somewhere, so it is started then rather than at launch: opening the wheel
+   opens the wheel and nothing else. swov is up in about fifteen
+   milliseconds, so the wait here is normally over before the drag has moved
+   far; if it is not, the drag falls back to the plain workspace tiles. */
+static int OV_SPAWNED;
+static int ov_bring_up(Config *c, int wait_ms)
+{
+    uint64_t t0;
+    if(OV_READY) return 1;
+    if(!c->overview) return 0;
+    if(!OV_SPAWNED){ OV_SPAWNED=1; ov_spawn(c); }
+    if(OV_OUT<0) return 0;
+    t0=now_ms_();
+    while(!OV_READY && (int64_t)(now_ms_()-t0) < wait_ms){
+        sw_dispatch(4);
+        ov_poll();
+    }
+    return OV_READY;
+}
+
 /* whatever it has said since the last frame */
 static void ov_poll(void){
     if(OV_OUT<0) return;
@@ -921,12 +949,9 @@ static void ov_poll(void){
             *nl='\0';
             if(OV_LOG) fprintf(stderr,"swas: <- %s\n",start);
             if(!strcmp(start,"ready")){
+                /* Nothing to raise: the wheel is a layer surface above the
+                   backdrop's, so it is already in front with the keyboard. */
                 OV_READY=1;
-                /* On the layer shell we are already above everything,
-                   so there is nothing to raise. */
-                /* On Wayland a window cannot lift itself, and the backdrop
-                   mapped on top of us. swov is talking to sway anyway. */
-                ov_send("raise " APP_ID);
             } else if(!strncmp(start,"target ",7)){
                 /* "target 3", "target 3 current", "target 3 beside 42 left" */
                 char buf[160]; snprintf(buf,sizeof buf,"%s",start+7);
@@ -1013,10 +1038,6 @@ static pid_t  WATCH_PID;
 static double WATCH_AT;
 static char   WATCH_NAME[64];
 
-static uint64_t now_ms_(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (uint64_t)ts.tv_sec*1000u + (uint64_t)(ts.tv_nsec/1000000);
-}
 static double now_secs_(void){ return (double)now_ms_()/1000.0; }
 
 static void err_say(const char*fmt,...){
@@ -1517,6 +1538,8 @@ int main(int argc,char**argv){
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
     float ui=cfg.ui_scale;
+    int redraw=1;                 /* something changed, so the frame is worth drawing */
+    float want_scale=1.0f, want_corner=0.0f;
 
     while(running){
         if(!sw_dispatch(0)) break;              /* the compositor went away */
@@ -1537,10 +1560,12 @@ int main(int argc,char**argv){
                 if(want>1.0f)  want=1.0f;
             }
             float step = cfg.drop_ms>0 ? 16.0f/(float)cfg.drop_ms : 1.0f;
+            float cwant = dragging ? 1.0f : 0.0f;
+            want_scale = want;
+            want_corner = cwant;
             if(wheel_scale<want){ wheel_scale+=step; if(wheel_scale>want)wheel_scale=want; }
             else if(wheel_scale>want){ wheel_scale-=step; if(wheel_scale<want)wheel_scale=want; }
 
-            float cwant = dragging ? 1.0f : 0.0f;
             if(corner_t<cwant){ corner_t+=step; if(corner_t>cwant)corner_t=cwant; }
             else if(corner_t>cwant){ corner_t-=step; if(corner_t<cwant)corner_t=cwant; }
         }
@@ -1629,6 +1654,7 @@ int main(int argc,char**argv){
 
         SwEvent ev;
         while(sw_poll(&ev)){
+            redraw=1;
             if(ev.type==SW_EV_CLOSED) running=0;
             else if(ev.type==SW_EV_KB_ENTER) had_focus=1;
             else if(ev.type==SW_EV_KB_LEAVE){
@@ -1649,12 +1675,10 @@ int main(int argc,char**argv){
                 if(press_down && !dragging && cfg.drop && press_item>=0){
                     float dx=mx-press_x, dy=my-press_y;
                     if(dx*dx+dy*dy > (float)(cfg.drop_px*cfg.drop_px)){
+                        ov_bring_up(&cfg, 300);
                         if(OV_READY){
                             dragging=1;
                             ov_send("drag on");
-                            /* the app on the pointer is drawn on this
-                               surface, so it has to be the one in front */
-                            ov_send("raise " APP_ID);
                         }
                         else {
                             wsp_load(&cfg);      /* first drag pays for the list */
@@ -1745,11 +1769,12 @@ int main(int argc,char**argv){
                                    workspace gets rearranged. */
                                 if(p>0) ov_send("assign %d %s",(int)p,OV_TARGET);
                                 adopt_to(&cfg,p,OV_TARGET,OV_BESIDE,OV_EDGE);
-                                /* the new window takes the focus as it opens;
-                                   the wheel is meant to stay in front of it */
+                                /* the new window takes the focus as it
+                                   opens, but it is an ordinary window and
+                                   the wheel is a layer surface above it, so
+                                   the wheel stays in front by itself */
                                 if(OV_ONCE) running=0;     /* one go */
                                 else if(OV_HERE && cfg.drop_close_here) running=0;
-                                else ov_send("raise " APP_ID);
                             }
                             ov_send("drag off");
                             OV_TARGET[0]='\0'; OV_HERE=0;
@@ -1812,16 +1837,26 @@ int main(int argc,char**argv){
         step = arc/(float)(vis>0?vis:1);
 
         /* ------------------------------ render ---------------------------- */
-        /* Every primitive is antialiased as it is drawn — the sectors and
-           triangles sample four times a pixel, the rounded rectangles come
-           from a distance field, the glyphs from stb_truetype — so the old
-           supersampled render target is gone and `ssaa` is ignored. */
+        /* Every primitive is antialiased as it is drawn — the sectors come
+           out of a distance field, the triangles out of half-plane distances,
+           the glyphs out of stb_truetype — so the old supersampled render
+           target is gone and `ssaa` is ignored.
+           A frame is only drawn when something has changed or something is
+           still moving: a wheel sitting still costs nothing. */
+        {
+            int moving = (wheel_scale!=want_scale) || (corner_t!=want_corner)
+                       || page_dir!=0 || ERR_TEXT[0]!=0 || WATCH_PID!=0;
+            if(cfg.animate && cfg.anim_ms>0 &&
+               (int64_t)(now_ms_()-anim0) < (int64_t)cfg.anim_ms) moving=1;
+            if(!redraw && !moving){ sw_dispatch(16); continue; }
+        }
+
         Canvas *ren = sw_win_begin(win);
         if(!ren){ sw_dispatch(8); continue; }   /* both buffers still on screen */
 
         /* With swov behind us it draws its own scrim; a second one over the
            top only makes the thing you are aiming at harder to see. */
-        if(!OV_READY) sw_canvas_fill(ren,cfg.bg);
+        if(!OV_READY) sw_canvas_bg(ren,cfg.bg);
 
         float slotw=step;
         /* everything inside the wheel is measured against this, so shrinking
@@ -1980,12 +2015,13 @@ int main(int argc,char**argv){
         }
 
         sw_win_end(win);
+        redraw=0;
 
         if(!ov_started && cfg.drop){
             ov_started=1;             /* only now: the wheel is already up */
-            /* an overview that started us is already there; otherwise bring
-               one up ourselves, if we were asked to */
-            if(!ov_adopt() && cfg.overview) ov_spawn(&cfg);
+            /* An overview that started us is already there. One of our own
+               waits until an app is being dragged — see ov_bring_up. */
+            ov_adopt();
         }
         sw_dispatch(16);            /* ~60 fps, and the compositor's events */
     }
