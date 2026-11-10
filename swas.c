@@ -57,7 +57,7 @@ typedef struct { float x,y,w,h; } Rect;
 
 #define APP_ID "swas"          /* wayland app_id / X11 WM_CLASS */
 
-#define SWAS_VERSION "1.3.3"
+#define SWAS_VERSION "1.3.4"
 #ifndef SWAS_BUILD             /* set by the Makefile: md5 of this file */
 #define SWAS_BUILD "unknown"
 #endif
@@ -360,13 +360,14 @@ static int font_load(UiFont*ft,const char*path,int px){
 static float text_width(UiFont*ft,float px_h,const char*s){
     (void)ft;
     int px=(int)(px_h+0.5f); if(px<4)px=4;
-    return sw_text_width(sw_font(px),s);
+    return sw_text_width(sw_font_h(px),s);
 }
 /* y is the top of the line, as it always was here; sw_text wants a baseline. */
 static void text_draw(Canvas*cv,UiFont*ft,float x,float y,float px_h,Col c,const char*s){
     (void)ft;
     int px=(int)(px_h+0.5f); if(px<4)px=4;
-    Font *f=sw_font(px);
+    /* the wheel sizes text by the height it has to fit, not by a font size */
+    Font *f=sw_font_h(px);
     sw_text(cv,f,x,y+f->ascent,c,s);
 }
 static void text_centered(Canvas*cv,UiFont*ft,float cx,float cy,float px_h,Col c,const char*s){

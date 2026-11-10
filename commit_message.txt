@@ -1,15 +1,13 @@
-sw_draw: size a font by its em square, not by ascent-to-descent
+sw_draw: sw_font_h(), a font sized by its line height
 
-sw_font(px) asked stb_truetype for ScaleForPixelHeight, which makes the
-ascent-to-descent span px pixels tall. Every other toolkit — FreeType's
-set_pixel_sizes, SDL_ttf's TTF_OpenFont, CSS — means the em square by a font
-size. The gap is the font's line height over its em, 1.21 for Inter and
-about 1.16 for DejaVu, so text came out roughly a fifth smaller than the
-number asked for. It is ScaleForMappingEmToPixels now.
+sw_font(px) means the em square, which is what a font size is everywhere
+else. Some callers do not have a font size, they have a box: the wheel in
+swas places a label at cy - height/2 and wants text that tall. For those,
+sw_font_h(px) returns the face whose line height is about px, found by
+measuring one and scaling.
 
-Note for swbr, which still has its own copy of this code: rebuilding it
-against this header makes its text that much larger, so its px values want
-lowering by about a sixth to keep the bar looking the way it does.
+Both are now available and neither guesses on the other's behalf: ask for a
+size with sw_font, for a height with sw_font_h.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01SuAfijAAYjLpcVwhCq3AF4

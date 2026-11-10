@@ -96,6 +96,9 @@ Font *sw_font(int px);                       /* cached per pixel size */
    face by drawing each glyph twice, a third of a pixel apart. */
 void  sw_fonts_bold(const char *path);
 Font *sw_font_bold(int px);
+/* A font whose line height is about px tall, for callers that size text by
+   the box it has to fill rather than by the font size. */
+Font *sw_font_h(int px);
 float sw_text_width(Font *f, const char *s);
 
 void  sw_canvas_clip(Canvas *cv, int x0, int y0, int x1, int y1);
@@ -450,6 +453,18 @@ static Font *sw_font_get(int px, bool bold)
 
 Font *sw_font(int px)      { return sw_font_get(px, false); }
 Font *sw_font_bold(int px) { return sw_font_get(px, true); }
+
+Font *sw_font_h(int px)
+{
+    Font *f;
+    int want;
+    if (px < 4) px = 4;
+    f = sw_font_get(px, false);
+    if (f->lineh <= 0.0f) return f;
+    want = (int)((float)px * (float)f->px / f->lineh + 0.5f);
+    if (want < 4) want = 4;
+    return want == f->px ? f : sw_font_get(want, false);
+}
 
 static unsigned sw_utf8_next(const char **p)
 {
