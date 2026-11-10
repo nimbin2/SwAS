@@ -1,44 +1,15 @@
-shared: a rasteriser fast enough for a full-screen overlay
+sw_draw: size a font by its em square, not by ascent-to-descent
 
-sw_draw.h was written for swbr, which draws a bar. Asked to draw a whole
-screen it cost 77 ms a frame at 1600x900 and most of a second at 4K, because
-every shape walked its bounding box and blended each pixel in floating
-point. What changed:
+sw_font(px) asked stb_truetype for ScaleForPixelHeight, which makes the
+ascent-to-descent span px pixels tall. Every other toolkit — FreeType's
+set_pixel_sizes, SDL_ttf's TTF_OpenFont, CSS — means the em square by a font
+size. The gap is the font's line height over its em, 1.21 for Inter and
+about 1.16 for DejaVu, so text came out roughly a fifth smaller than the
+number asked for. It is ScaleForMappingEmToPixels now.
 
-  - Blending is 8-bit integer throughout. A run of one colour composites two
-    channels at a time out of a packed word, so the inner loop is one
-    multiply per half and an add.
-  - Every shape fills its solid middle with plain spans and keeps the
-    distance field for the edge: a rounded rectangle evaluates it only in
-    the four corners, a circle only at the ends of each span, an annular
-    wedge only inside its own bounding box rather than the whole disc.
-  - Triangles are a distance field too, stepped along the row, instead of
-    four samples a pixel.
-  - sw_canvas_bg() replaces the clip rectangle instead of blending into it,
-    for the one fill that is always the first thing drawn.
-
-Measured, same frames: a swov-like frame 77 -> 1.2 ms at 1600x900 and
-473 -> 6.6 ms at 4K; a swas-like frame 278 -> 7.4 ms and 1741 -> 40 ms; a
-single wedge 24 -> 0.24 ms. Output is unchanged to the eye — the distance
-fields antialias at least as well as the sampling did.
-
-Earlier in this release: bold faces (sw_fonts_bold / sw_font_bold, with a
-synthesised bold when the desktop ships one weight), offscreen canvases
-(sw_canvas_new / sw_blit_canvas) for the backdrop's fade and blur,
-sw_write_png for swov --shot, sw_text_width_n and sw_font_descent.
-
-sw_wl.h: SwEvent.code carries the raw evdev keycode, so a program can read a
-key by its place on the board; and sw_win_create accepts a NULL SwApp, which
-a program driving its own frames has no use for and which used to crash.
-
-sw_keymap.h: a built-in US layout as a fallback. Any keycode the parsed
-keymap has nothing for, and every key when the parse failed outright, comes
-from a compact evdev table instead of returning nothing. A keymap this
-parser cannot read now costs the user their layout, not their keyboard.
-
-sw_wl.h: SW_DEBUG_KEYS=1 in the environment narrates the keyboard to stderr
-— the keymap's size and whether it parsed, keyboard enter and leave, and
-every key with its code, keysym, modifiers and character.
+Note for swbr, which still has its own copy of this code: rebuilding it
+against this header makes its text that much larger, so its px values want
+lowering by about a sixth to keep the bar looking the way it does.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01SuAfijAAYjLpcVwhCq3AF4

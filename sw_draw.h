@@ -428,9 +428,13 @@ static Font *sw_font_get(int px, bool bold)
     f->px = px;
     f->bold = bold;
     f->synth = bold && !sw_font_bld.ok;
-    f->sc_pri = sw_font_pri.ok ? stbtt_ScaleForPixelHeight(&sw_font_pri.info, (float)px) : 1.0f;
-    f->sc_alt = sw_font_alt.ok ? stbtt_ScaleForPixelHeight(&sw_font_alt.info, (float)px) : 1.0f;
-    f->sc_bold = sw_font_bld.ok ? stbtt_ScaleForPixelHeight(&sw_font_bld.info, (float)px) : 1.0f;
+    /* px is the em square, which is what every other toolkit means by a font
+       size — FreeType's set_pixel_sizes, SDL_ttf's TTF_OpenFont, CSS. Scaling
+       by ascent-descent instead, as this did at first, draws a fifth smaller
+       than the number in the config asks for. */
+    f->sc_pri = sw_font_pri.ok ? stbtt_ScaleForMappingEmToPixels(&sw_font_pri.info, (float)px) : 1.0f;
+    f->sc_alt = sw_font_alt.ok ? stbtt_ScaleForMappingEmToPixels(&sw_font_alt.info, (float)px) : 1.0f;
+    f->sc_bold = sw_font_bld.ok ? stbtt_ScaleForMappingEmToPixels(&sw_font_bld.info, (float)px) : 1.0f;
     {
         FontFile *mf = (bold && sw_font_bld.ok) ? &sw_font_bld : &sw_font_pri;
         float msc = (bold && sw_font_bld.ok) ? f->sc_bold : f->sc_pri;

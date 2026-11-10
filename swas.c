@@ -57,7 +57,7 @@ typedef struct { float x,y,w,h; } Rect;
 
 #define APP_ID "swas"          /* wayland app_id / X11 WM_CLASS */
 
-#define SWAS_VERSION "1.3.2"
+#define SWAS_VERSION "1.3.3"
 #ifndef SWAS_BUILD             /* set by the Makefile: md5 of this file */
 #define SWAS_BUILD "unknown"
 #endif
