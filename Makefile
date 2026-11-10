@@ -1,24 +1,20 @@
 # swas — Makefile
 #
-#   make            build (SDL3 linked dynamically, via pkg-config)   -> ./swas
-#   make static     build with SDL3 baked in (no libSDL3.so needed at runtime)
+#   make            build                               -> ./swas
 #   make strict     build with -Wall -Wextra (for hacking on it)
 #   make run        build and run
-#   make install    install to $(PREFIX)/bin           (default: /usr)
+#   make install    install to $(PREFIX)/bin            (default: /usr)
 #                   the example goes to $(PREFIX)/share/swas
 #   make config     write a default config to ~/.config/swas/config
 #   make link       symlink ~/.config/swas/config at the installed example
 #   make uninstall
 #   make clean
 #
-# Requires: a C compiler, pkg-config, and SDL3 dev files.
-# `make static` additionally needs the SDL3 *static* library (libSDL3.a). Distro
-# packages don't always ship it; if it's missing, build SDL from source with
-# -DSDL_STATIC=ON (see README) or just use the default dynamic `make`.
+# Requires: a C compiler and the libwayland-client dev files. Nothing else —
+# fonts, icons and SVGs are decoded in-tree, and the window is a Wayland
+# layer-shell surface drawn by swas itself.
 #
-# Note: even a "static" build still loads your system's Wayland/X11 libraries at
-# runtime (that's how SDL finds a display) — it removes the SDL install
-# requirement, not every runtime dependency.
+# Written/modified by: Claude Opus 4.1, Claude Sonnet 4.5, Claude Opus 5
 
 CC          ?= cc
 PKG_CONFIG  ?= pkg-config
@@ -30,32 +26,23 @@ datadir     ?= $(PREFIX)/share/swas
 BUILD       := $(shell md5sum swas.c 2>/dev/null | cut -c1-8)
 SRC         := swas.c
 BIN         := swas
+HDRS        := stb_truetype.h stb_image.h nanosvg.h nanosvgrast.h \
+               sw_theme.h sw_draw.h sw_wl.h sw_keymap.h
 
-SDL_CFLAGS  := $(shell $(PKG_CONFIG) --cflags sdl3)
-SDL_LIBS    := $(shell $(PKG_CONFIG) --libs sdl3)
-SDL_LDPATH  := $(shell $(PKG_CONFIG) --libs-only-L sdl3)
-# transitive libs SDL needs when it is linked statically, minus SDL itself:
-SDL_STATIC_EXTRA := $(filter-out -lSDL3,$(shell $(PKG_CONFIG) --static --libs sdl3))
+WL_CFLAGS   := $(shell $(PKG_CONFIG) --cflags wayland-client 2>/dev/null)
+WL_LIBS     := $(shell $(PKG_CONFIG) --libs wayland-client 2>/dev/null || echo -lwayland-client)
 
-.PHONY: all static strict run install config link uninstall clean
+.PHONY: all strict run install config link uninstall clean
 
 all: $(BIN)
 
-$(BIN): $(SRC) stb_truetype.h stb_image.h sw_theme.h
-	$(CC) $(CFLAGS) -DSWAS_BUILD='"$(BUILD)"' $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+$(BIN): $(SRC) $(HDRS)
+	$(CC) $(CFLAGS) -DSWAS_BUILD='"$(BUILD)"' $(WL_CFLAGS) $(SRC) -o $(BIN) $(WL_LIBS) -lm
 	@./$(BIN) --version
 
-# Link libSDL3.a statically while keeping system libs dynamic.
-static: $(SRC) stb_truetype.h stb_image.h sw_theme.h
-	$(CC) $(CFLAGS) -DSWAS_BUILD='"$(BUILD)"' $(SDL_CFLAGS) $(SRC) -o $(BIN) \
-	  $(SDL_LDPATH) -Wl,-Bstatic -lSDL3 -Wl,-Bdynamic $(SDL_STATIC_EXTRA) -lm
-	@echo "built ./$(BIN) with SDL baked in:"; \
-	 ldd $(BIN) | grep -qi SDL3 && echo "  (warning: still links libSDL3.so)" \
-	   || echo "  no libSDL3.so dependency."
-
-strict: $(SRC) stb_truetype.h stb_image.h sw_theme.h
+strict: $(SRC) $(HDRS)
 	$(CC) -O2 -Wall -Wextra -Wno-misleading-indentation -DSWAS_BUILD='"$(BUILD)"' \
-	  $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+	  $(WL_CFLAGS) $(SRC) -o $(BIN) $(WL_LIBS) -lm
 
 run: all
 	./$(BIN)

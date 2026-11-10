@@ -1,7 +1,10 @@
 # swas
 
-Sway App Selector: a radial app launcher, drawn with SDL3. Apps sit in wide slots across the top
-arc; point at one and click, or type to filter. Works on Wayland and X11.
+Sway App Selector: a radial app launcher for Wayland. Apps sit in wide slots across the top
+arc; point at one and click, or type to filter.
+
+No toolkit. swas draws itself on a layer-shell surface and links only
+`libwayland-client`.
 
 ![swas](screenshot.png)
 
@@ -12,20 +15,17 @@ arc; point at one and click, or type to filter. Works on Wayland and X11.
 Debian trixie and newer:
 
 ```sh
-sudo apt install build-essential pkg-config libsdl3-dev
+sudo apt install build-essential pkg-config libwayland-dev
 make
 sudo make install     # /usr/bin, examples in /usr/share/swas
 make config           # optional: write a default config to ~/.config/swas/config
 make link             # or: config -> the installed example, kept in sync
 ```
 
-`make static` bakes SDL3 into the binary, so it runs without `libSDL3.so`. It
-needs `libSDL3.a`, which distro packages do not always ship.
-
-On bookworm the SDL3 package does not exist yet; build SDL 3.2+ from source and
-set `PKG_CONFIG_PATH`.
-
 Needs any TTF font. Icons need a `.desktop` file and an icon theme.
+
+Your compositor must support `wlr-layer-shell` — sway, Hyprland, river,
+labwc and the other wlroots compositors do.
 
 ## Use
 
@@ -211,7 +211,6 @@ knowing:
 | `arc` | degrees of the ring used for apps; the rest is the paging zone |
 | `radius`, `y_offset` | wheel size and where it sits |
 | `ui_scale` | scales all text at once |
-| `ssaa` | supersampling 1–4 |
 | `icons`, `icon_px` | `.desktop` icons and their size |
 | `sort` | `recent` or `alpha` |
 | `include`, `exclude`, `dirs` | which apps show, and in what order |
@@ -246,8 +245,13 @@ that.
 - The window is mapped and focused before the `.desktop` scan and the font
   load, so anything typed while it starts is queued by the compositor instead
   of being lost.
-- "Fullscreen" is a borderless window the size of the display, not exclusive
-  fullscreen: that would make the surface opaque and flicker the mode on close.
+- The window is a layer-shell overlay, so it covers the screen without
+  becoming a real fullscreen window: no mode flicker, and sway keeps the
+  windows underneath exactly as they were.
+- Keyboard layout comes from the compositor's own keymap, so dead keys, AltGr
+  and non-US layouts type correctly. There is no `libxkbcommon` to install.
+- `ssaa` is accepted and ignored. Every shape is antialiased as it is drawn,
+  so there is nothing left to supersample.
 - Apps whose `.desktop` file says `Terminal=true` are run inside `terminal=`.
 - SVG icons are rasterised at the size they are drawn, so they stay sharp at
   any `icon_px`.

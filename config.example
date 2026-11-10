@@ -21,7 +21,7 @@ page_ms=110       # base ms per paged step at the SLOW end. Bigger = calmer
                   # zone, fast toward straight-down.
 
 # --- rendering ---
-ssaa=2            # full-scene supersampling 1..4 (smooths edges). alias: aa
+ssaa=2            # ignored: every shape is antialiased as it is drawn. alias: aa
 animate=1         # subtle settle animation when the search results change
 anim_ms=90        # its duration (0 or animate=0 to turn it off)
 icons=1           # show .desktop icons if found (PNG/SVG/JPG/BMP)

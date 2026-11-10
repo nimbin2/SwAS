@@ -1,15 +1,19 @@
 /*
- * swas — Sway App Selector: a radial (weapon-wheel) app launcher, Wayland & X11.
+ * swas — Sway App Selector: a radial (weapon-wheel) app launcher for Wayland.
+ *
+ * Written/modified by: Claude Opus 4.1, Claude Sonnet 4.5, Claude Opus 5
  *
  * Dependencies:
- *   - SDL3            (the only library you link)
+ *   - libwayland-client  (the only library you link)
+ *   - sw_draw.h / sw_wl.h / sw_keymap.h  (in-tree: rasteriser, layer-shell
+ *     window, keymap — shared with swbr and swov)
  *   - stb_truetype.h  (vendored single-header — smooth fonts)
  *   - stb_image.h     (vendored single-header — PNG/JPG/BMP icons)
  *   - nanosvg.h + nanosvgrast.h  (vendored single-header — SVG icons)
  * The vendored *.h files just sit next to this source; nothing to install/link.
  *
  * Build:
- *   cc swas.c -o swas $(pkg-config --cflags --libs sdl3) -lm
+ *   cc swas.c -o swas -lwayland-client -lm
  *
  * See --help for every option (all config keys also work on the command line).
  */
@@ -27,7 +31,8 @@
  *   9. main()               setup, then the event + render loop
  * ------------------------------------------------------------------------- */
 
-#include <SDL3/SDL.h>
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
@@ -39,9 +44,20 @@
 
 #include "sw_theme.h"
 
+/* The window, the canvas and the keyboard. swas draws every pixel itself, so
+   there is no renderer and no GPU: a layer-shell surface with a shared memory
+   buffer, filled in by hand. */
+#define SW_DRAW_IMPL
+#include "sw_draw.h"
+typedef struct { float x,y,w,h; } Rect;
+#define SW_KEYMAP_IMPL
+#include "sw_keymap.h"
+#define SW_WL_IMPL
+#include "sw_wl.h"
+
 #define APP_ID "swas"          /* wayland app_id / X11 WM_CLASS */
 
-#define SWAS_VERSION "1.2"
+#define SWAS_VERSION "1.3"
 #ifndef SWAS_BUILD             /* set by the Makefile: md5 of this file */
 #define SWAS_BUILD "unknown"
 #endif
@@ -68,6 +84,7 @@
 #include <dirent.h>
 #include <glob.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -85,8 +102,7 @@
 #define ICON_AR (60.0f*(float)DEG)    /* bottom-right paging icon */
 
 /* ------------------------------------------------------------------ */
-typedef struct { Uint8 r, g, b, a; } Col;
-static SDL_FColor tofc(Col c){ SDL_FColor f={c.r/255.0f,c.g/255.0f,c.b/255.0f,c.a/255.0f}; return f; }
+/* Col comes from sw_draw.h — the canvas and this file agree on it. */
 static char *xstrdup(const char *s){ char*p=malloc(strlen(s)+1); if(p)strcpy(p,s); return p; }
 static char *trim(char *s){
     while(*s && isspace((unsigned char)*s)) s++;
@@ -106,7 +122,7 @@ static void parse_color(const char*s, Col*out){
     if(strlen(s)>=8 && sscanf(s,"%2x%2x%2x%2x",&r,&g,&b,&a)==4){}
     else if(sscanf(s,"%2x%2x%2x",&r,&g,&b)==3){}
     else return;
-    out->r=(Uint8)r; out->g=(Uint8)g; out->b=(Uint8)b; out->a=(Uint8)a;
+    out->r=(uint8_t)r; out->g=(uint8_t)g; out->b=(uint8_t)b; out->a=(uint8_t)a;
 }
 static int file_exists(const char*p){ struct stat st; return stat(p,&st)==0 && S_ISREG(st.st_mode); }
 static float clampf(float v,float lo,float hi){ return v<lo?lo:(v>hi?hi:v); }
@@ -287,16 +303,14 @@ static void config_load(Config*c,const char*path){
 }
 
 /* ------------------------------------------------------------------ */
-/* text: TTF atlas via stb_truetype, with debug-font fallback          */
+/* text: sw_draw's glyph cache                                         */
 /* ------------------------------------------------------------------ */
-#define GLYPH_LO 32
-#define GLYPH_HI 255
-#define NGLYPH   (GLYPH_HI-GLYPH_LO+1)
-
-typedef struct {
-    int ok; SDL_Texture *atlas; int px; float baseline;
-    struct { float u,v,w,h,xoff,yoff,adv; } g[NGLYPH];
-} Font;
+/* There used to be an atlas here: every glyph rasterised once at one size
+   into a texture, then scaled. sw_draw caches per pixel size instead and
+   rasterises a glyph the first time it is asked for, so text at any size is
+   sharp rather than a scaled-up copy of one size. What is left is the old
+   call shape, because a hundred call sites are written against it. */
+typedef struct { int ok; int px; } UiFont;
 
 static int try_font_paths(char*out,size_t n){
     const char*cand[]={
@@ -333,103 +347,32 @@ static int fc_match(const char*pattern,char*out,size_t n){
     return 0;
 }
 
-static int font_load(Font*ft,SDL_Renderer*ren,const char*path,int px){
-    memset(ft,0,sizeof *ft); ft->px=px;
-    FILE*f=fopen(path,"rb"); if(!f) return 0;
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    unsigned char*buf=malloc(sz);
-    if(!buf||fread(buf,1,sz,f)!=(size_t)sz){ fclose(f); free(buf); return 0; }
-    fclose(f);
-    stbtt_fontinfo info;
-    if(!stbtt_InitFont(&info,buf,stbtt_GetFontOffsetForIndex(buf,0))){ free(buf); return 0; }
-    float sc=stbtt_ScaleForPixelHeight(&info,(float)px);
-    int asc,desc,gap; stbtt_GetFontVMetrics(&info,&asc,&desc,&gap); ft->baseline=asc*sc;
-
-    int AW=1024, penx=0,peny=0,rowh=0;
-    for(int cp=GLYPH_LO;cp<=GLYPH_HI;cp++){
-        int x0,y0,x1,y1; stbtt_GetCodepointBitmapBox(&info,cp,sc,sc,&x0,&y0,&x1,&y1);
-        int gw=x1-x0,gh=y1-y0; if(gw<0)gw=0; if(gh<0)gh=0;
-        if(penx+gw+1>AW){ penx=0; peny+=rowh+1; rowh=0; }
-        if(gh>rowh)rowh=gh;
-        penx+=gw+1;
-    }
-    int AH=peny+rowh+1; if(AH<1)AH=1;
-    Uint32*pix=calloc((size_t)AW*AH,4); if(!pix){ free(buf); return 0; }
-
-    penx=0;peny=0;rowh=0;
-    for(int cp=GLYPH_LO;cp<=GLYPH_HI;cp++){
-        int aw,lsb; stbtt_GetCodepointHMetrics(&info,cp,&aw,&lsb);
-        int x0,y0,x1,y1; stbtt_GetCodepointBitmapBox(&info,cp,sc,sc,&x0,&y0,&x1,&y1);
-        int gw=x1-x0,gh=y1-y0; if(gw<0)gw=0; if(gh<0)gh=0;
-        if(penx+gw+1>AW){ penx=0; peny+=rowh+1; rowh=0; }
-        if(gw&&gh){
-            unsigned char*bmp=malloc((size_t)gw*gh);
-            stbtt_MakeCodepointBitmap(&info,bmp,gw,gh,gw,sc,sc,cp);
-            for(int yy=0;yy<gh;yy++)for(int xx=0;xx<gw;xx++)
-                pix[(peny+yy)*AW+(penx+xx)]=((Uint32)bmp[yy*gw+xx]<<24)|0x00FFFFFF;
-            free(bmp);
-        }
-        int gi=cp-GLYPH_LO;
-        ft->g[gi].u=penx; ft->g[gi].v=peny; ft->g[gi].w=gw; ft->g[gi].h=gh;
-        ft->g[gi].xoff=x0; ft->g[gi].yoff=y0; ft->g[gi].adv=aw*sc;
-        if(gh>rowh)rowh=gh;
-        penx+=gw+1;
-    }
-    free(buf);
-    SDL_Surface*surf=SDL_CreateSurfaceFrom(AW,AH,SDL_PIXELFORMAT_ABGR8888,pix,AW*4);
-    if(!surf){ free(pix); return 0; }
-    ft->atlas=SDL_CreateTextureFromSurface(ren,surf);
-    SDL_DestroySurface(surf); free(pix);
-    if(!ft->atlas) return 0;
-    SDL_SetTextureScaleMode(ft->atlas,SDL_SCALEMODE_LINEAR);
-    SDL_SetTextureBlendMode(ft->atlas,SDL_BLENDMODE_BLEND);
-    ft->ok=1; return 1;
+static int font_load(UiFont*ft,const char*path,int px){
+    ft->ok=0; ft->px=px;
+    sw_fonts_init(path,NULL);
+    UiFont *probe=ft;                       /* a font with no glyphs is no font */
+    if(sw_text_width(sw_font(px),"M")>0.0f) probe->ok=1;
+    return ft->ok;
 }
 
-static unsigned utf8_next(const char**p){
-    const unsigned char*s=(const unsigned char*)*p; unsigned cp; int n;
-    if(s[0]<0x80){cp=s[0];n=1;}
-    else if((s[0]&0xE0)==0xC0){cp=s[0]&0x1F;n=2;}
-    else if((s[0]&0xF0)==0xE0){cp=s[0]&0x0F;n=3;}
-    else if((s[0]&0xF8)==0xF0){cp=s[0]&0x07;n=4;}
-    else{ *p=(const char*)(s+1); return 0xFFFD; }
-    for(int i=1;i<n;i++){ if((s[i]&0xC0)!=0x80){n=i;break;} cp=(cp<<6)|(s[i]&0x3F); }
-    *p=(const char*)(s+n); return cp;
+/* utf8_next lived here; sw_draw walks the string itself now. */
+
+static float text_width(UiFont*ft,float px_h,const char*s){
+    (void)ft;
+    int px=(int)(px_h+0.5f); if(px<4)px=4;
+    return sw_text_width(sw_font(px),s);
 }
-static float text_width(Font*ft,float px_h,const char*s){
-    if(!ft->ok) return strlen(s)*8.0f*(px_h/8.0f);
-    float ds=px_h/ft->px,w=0; const char*p=s;
-    while(*p){ unsigned cp=utf8_next(&p); if(cp<GLYPH_LO||cp>GLYPH_HI)cp='?'; w+=ft->g[cp-GLYPH_LO].adv*ds; }
-    return w;
+/* y is the top of the line, as it always was here; sw_text wants a baseline. */
+static void text_draw(Canvas*cv,UiFont*ft,float x,float y,float px_h,Col c,const char*s){
+    (void)ft;
+    int px=(int)(px_h+0.5f); if(px<4)px=4;
+    Font *f=sw_font(px);
+    sw_text(cv,f,x,y+f->ascent,c,s);
 }
-static void text_draw(SDL_Renderer*r,Font*ft,float x,float y,float px_h,Col c,const char*s){
-    if(!ft->ok){
-        /* built-in 8x8 font: compose with any active render scale (e.g. SSAA) */
-        float k=px_h/8.0f, csx,csy; SDL_GetRenderScale(r,&csx,&csy);
-        SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
-        SDL_SetRenderScale(r,csx*k,csy*k);
-        SDL_RenderDebugText(r,x/k,y/k,s);
-        SDL_SetRenderScale(r,csx,csy);
-        return;
-    }
-    float ds=px_h/ft->px;
-    SDL_SetTextureColorMod(ft->atlas,c.r,c.g,c.b);
-    SDL_SetTextureAlphaMod(ft->atlas,c.a);
-    float pen=x; const char*p=s;
-    while(*p){ unsigned cp=utf8_next(&p); if(cp<GLYPH_LO||cp>GLYPH_HI)cp='?';
-        int gi=cp-GLYPH_LO;
-        if(ft->g[gi].w>0&&ft->g[gi].h>0){
-            SDL_FRect src={ft->g[gi].u,ft->g[gi].v,ft->g[gi].w,ft->g[gi].h};
-            SDL_FRect dst={pen+ft->g[gi].xoff*ds,y+(ft->baseline+ft->g[gi].yoff)*ds,ft->g[gi].w*ds,ft->g[gi].h*ds};
-            SDL_RenderTexture(r,ft->atlas,&src,&dst);
-        }
-        pen+=ft->g[gi].adv*ds;
-    }
+static void text_centered(Canvas*cv,UiFont*ft,float cx,float cy,float px_h,Col c,const char*s){
+    float w=text_width(ft,px_h,s); text_draw(cv,ft,cx-w/2,cy-px_h/2,px_h,c,s);
 }
-static void text_centered(SDL_Renderer*r,Font*ft,float cx,float cy,float px_h,Col c,const char*s){
-    float w=text_width(ft,px_h,s); text_draw(r,ft,cx-w/2,cy-px_h/2,px_h,c,s);
-}
-static void fit_label(Font*ft,float px_h,const char*s,float max_w,char*out,size_t n){
+static void fit_label(UiFont*ft,float px_h,const char*s,float max_w,char*out,size_t n){
     if(text_width(ft,px_h,s)<=max_w){ snprintf(out,n,"%s",s); return; }
     char buf[256]; snprintf(buf,sizeof buf,"%s",s); int len=(int)strlen(buf);
     while(len>1){ buf[len]='\0';
@@ -445,7 +388,7 @@ static void fit_label(Font*ft,float px_h,const char*s,float max_w,char*out,size_
 /* ------------------------------------------------------------------ */
 typedef struct {
     char *id,*name,*exec,*icon; int terminal;
-    SDL_Texture *tex; int icon_tried; int recent;   /* 1 = present in launch history */
+    Image tex; int icon_tried; int recent;   /* 1 = present in launch history */
 } App;
 typedef struct { App*v; int n,cap; } AppList;
 
@@ -491,7 +434,7 @@ static int parse_desktop(const char*path,const char*id,App*out){
     if(ok){
         out->id=xstrdup(id); out->name=name; name=NULL;
         out->exec=strip_field_codes(exec); out->icon=icon; icon=NULL;
-        out->terminal=terminal; out->tex=NULL; out->icon_tried=0;
+        out->terminal=terminal; memset(&out->tex,0,sizeof out->tex); out->icon_tried=0;
     }
     free(name);free(exec);free(type);free(icon);
     return ok;
@@ -711,15 +654,14 @@ static void resolve_icon(const char*name,char*out,size_t n){
         if(file_exists(p)){ snprintf(out,n,"%s",p); return; }
     }
 }
-static SDL_Texture *load_icon_tex(SDL_Renderer*ren,const char*path){
+/* An icon is now just its pixels: straight RGBA, which is what both stb_image
+   and nanosvg hand back and what sw_blit takes. */
+static Image load_icon_img(const char*path){
+    Image im={0};
     int w,h,ch; unsigned char*data=stbi_load(path,&w,&h,&ch,4);
-    if(!data) return NULL;
-    SDL_Surface*s=SDL_CreateSurfaceFrom(w,h,SDL_PIXELFORMAT_ABGR8888,data,w*4);
-    if(!s){ stbi_image_free(data); return NULL; }
-    SDL_Texture*t=SDL_CreateTextureFromSurface(ren,s);
-    SDL_DestroySurface(s); stbi_image_free(data);
-    if(t){ SDL_SetTextureScaleMode(t,SDL_SCALEMODE_LINEAR); SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND); }
-    return t;
+    if(!data) return im;
+    im.rgba=data; im.w=w; im.h=h; im.stride=w*4;
+    return im;
 }
 static int ends_with_ci(const char*s,const char*suf){
     size_t ls=strlen(s),lf=strlen(suf);
@@ -732,10 +674,11 @@ static int ends_with_ci(const char*s,const char*suf){
    here is the declared canvas and the shapes' own bounds together: an icon
    with deliberate padding keeps it, one that overflows is scaled down instead
    of losing an edge. */
-static SDL_Texture *load_svg_tex(SDL_Renderer*ren,const char*path,int px){
+static Image load_svg_img(const char*path,int px){
+    Image out={0};
     if(px<16)px=16; if(px>512)px=512;
     NSVGimage*img=nsvgParseFromFile(path,"px",96.0f);
-    if(!img) return NULL;
+    if(!img) return out;
     float x0=0,y0=0,x1=img->width,y1=img->height;
     if(x1<=0||y1<=0){ x0=y0=1e30f; x1=y1=-1e30f; }   /* no usable canvas */
     for(NSVGshape*s=img->shapes;s;s=s->next){
@@ -747,32 +690,29 @@ static SDL_Texture *load_svg_tex(SDL_Renderer*ren,const char*path,int px){
         if(s->bounds[3]+m>y1) y1=s->bounds[3]+m;
     }
     float bw=x1-x0, bh=y1-y0;
-    if(!(bw>0.0f)||!(bh>0.0f)){ nsvgDelete(img); return NULL; }
+    if(!(bw>0.0f)||!(bh>0.0f)){ nsvgDelete(img); return out; }
     float sc=(float)px/(bw>bh?bw:bh);
     int ow=(int)(bw*sc+0.5f), oh=(int)(bh*sc+0.5f);
     if(ow<1)ow=1; if(oh<1)oh=1;
     unsigned char*pix=calloc((size_t)ow*oh,4);
     NSVGrasterizer*r=nsvgCreateRasterizer();
-    if(!pix||!r){ free(pix); if(r)nsvgDeleteRasterizer(r); nsvgDelete(img); return NULL; }
+    if(!pix||!r){ free(pix); if(r)nsvgDeleteRasterizer(r); nsvgDelete(img); return out; }
     nsvgRasterize(r,img,-x0*sc,-y0*sc,sc,pix,ow,oh,ow*4);
     nsvgDeleteRasterizer(r); nsvgDelete(img);
-    SDL_Surface*s=SDL_CreateSurfaceFrom(ow,oh,SDL_PIXELFORMAT_ABGR8888,pix,ow*4);
-    if(!s){ free(pix); return NULL; }
-    SDL_Texture*t=SDL_CreateTextureFromSurface(ren,s);
-    SDL_DestroySurface(s); free(pix);
-    if(t){ SDL_SetTextureScaleMode(t,SDL_SCALEMODE_LINEAR); SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND); }
-    return t;
+    out.rgba=pix; out.w=ow; out.h=oh; out.stride=ow*4;
+    return out;
 }
-static SDL_Texture *app_icon(SDL_Renderer*ren,App*a,Config*c){
-    if(!c->icons) return NULL;
+static Image app_icon(App*a,Config*c){
+    Image none={0};
+    if(!c->icons) return none;
     if(!a->icon_tried){ a->icon_tried=1;
         char path[PATH_MAX]; resolve_icon(a->icon,path,sizeof path);
         if(*path){
             if(ends_with_ci(path,".svg")){
                 int px=(int)(c->icon_px*c->ui_scale*2.0f); if(px<48)px=48; if(px>256)px=256;
-                a->tex=load_svg_tex(ren,path,px);
+                a->tex=load_svg_img(path,px);
             } else {
-                a->tex=load_icon_tex(ren,path);
+                a->tex=load_icon_img(path);
             }
         }
     }
@@ -967,7 +907,7 @@ static void ov_spawn(Config*c){
 }
 
 /* whatever it has said since the last frame */
-static void ov_poll(SDL_Window*win){
+static void ov_poll(void){
     if(OV_OUT<0) return;
     static char buf[512]; static int len;
 
@@ -982,7 +922,8 @@ static void ov_poll(SDL_Window*win){
             if(OV_LOG) fprintf(stderr,"swas: <- %s\n",start);
             if(!strcmp(start,"ready")){
                 OV_READY=1;
-                SDL_RaiseWindow(win);          /* enough on X11 */
+                /* On the layer shell we are already above everything,
+                   so there is nothing to raise. */
                 /* On Wayland a window cannot lift itself, and the backdrop
                    mapped on top of us. swov is talking to sway anyway. */
                 ov_send("raise " APP_ID);
@@ -1072,7 +1013,11 @@ static pid_t  WATCH_PID;
 static double WATCH_AT;
 static char   WATCH_NAME[64];
 
-static double now_secs_(void){ return (double)SDL_GetTicks()/1000.0; }
+static uint64_t now_ms_(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (uint64_t)ts.tv_sec*1000u + (uint64_t)(ts.tv_nsec/1000000);
+}
+static double now_secs_(void){ return (double)now_ms_()/1000.0; }
 
 static void err_say(const char*fmt,...){
     va_list ap; va_start(ap,fmt);
@@ -1154,66 +1099,36 @@ static pid_t launch(App*a,Config*c){
 /* ------------------------------------------------------------------ */
 /* geometry primitives                                                 */
 /* ------------------------------------------------------------------ */
-static void fill_circle(SDL_Renderer*r,float cx,float cy,float rad,Col c){
-    const int SEG=96; SDL_Vertex v[SEG+2]; SDL_FColor fc=tofc(c);
-    v[0].position=(SDL_FPoint){cx,cy}; v[0].color=fc; v[0].tex_coord=(SDL_FPoint){0,0};
-    for(int i=0;i<=SEG;i++){ float a=(float)(2*M_PI*i/SEG);
-        v[i+1].position=(SDL_FPoint){cx+rad*cosf(a),cy+rad*sinf(a)};
-        v[i+1].color=fc; v[i+1].tex_coord=(SDL_FPoint){0,0}; }
-    int idx[SEG*3]; for(int i=0;i<SEG;i++){ idx[i*3]=0; idx[i*3+1]=i+1; idx[i*3+2]=i+2; }
-    SDL_RenderGeometry(r,NULL,v,SEG+2,idx,SEG*3);
+/* The shapes the wheel is made of: thin wrappers over sw_draw, antialiased
+   in software. The signatures are the ones the drawing code below expects. */
+static void fill_circle(Canvas*cv,float cx,float cy,float rad,Col c){
+    sw_fill_circle(cv,cx,cy,rad,c);
 }
 /* a thin outline circle: the "let go here" hint around the parked wheel */
-static void ring(SDL_Renderer*r,float cx,float cy,float rad,float thick,Col c){
-    const int SEG=96; SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
-    for(float t=0;t<thick;t+=1.0f)
-        for(int i=0;i<SEG;i++){ float a=(float)(2*M_PI*i/SEG);
-            SDL_FRect d={cx+(rad+t)*cosf(a),cy+(rad+t)*sinf(a),1.5f,1.5f};
-            SDL_RenderFillRect(r,&d); }
+static void ring(Canvas*cv,float cx,float cy,float rad,float thick,Col c){
+    sw_stroke_round(cv,cx-rad,cy-rad,rad*2,rad*2,rad,rad,rad,rad,thick,c);
 }
-
-static void fill_sector(SDL_Renderer*r,float cx,float cy,float r0,float r1,float a0,float a1,Col c){
-    int seg=(int)((a1-a0)/0.04f)+2; if(seg<2)seg=2; if(seg>160)seg=160;
-    int nv=(seg+1)*2; SDL_Vertex*v=malloc(nv*sizeof*v); SDL_FColor fc=tofc(c);
-    for(int i=0;i<=seg;i++){ float a=a0+(a1-a0)*i/seg,ca=cosf(a),sa=sinf(a);
-        v[2*i].position=(SDL_FPoint){cx+r0*ca,cy+r0*sa};
-        v[2*i+1].position=(SDL_FPoint){cx+r1*ca,cy+r1*sa};
-        v[2*i].color=v[2*i+1].color=fc; v[2*i].tex_coord=v[2*i+1].tex_coord=(SDL_FPoint){0,0}; }
-    int ni=seg*6,*idx=malloc(ni*sizeof*idx);
-    for(int i=0;i<seg;i++){ int b=2*i;
-        idx[i*6]=b;idx[i*6+1]=b+1;idx[i*6+2]=b+2; idx[i*6+3]=b+1;idx[i*6+4]=b+3;idx[i*6+5]=b+2; }
-    SDL_RenderGeometry(r,NULL,v,nv,idx,ni); free(v); free(idx);
+static void fill_sector(Canvas*cv,float cx,float cy,float r0,float r1,float a0,float a1,Col c){
+    sw_fill_sector(cv,cx,cy,r0,r1,a0,a1,c);
 }
-static void fill_round_rect(SDL_Renderer*r,float x,float y,float w,float h,float rad,Col c){
-    if(rad>w/2)rad=w/2; if(rad>h/2)rad=h/2;
-    SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
-    SDL_FRect mid={x,y+rad,w,h-2*rad}, top={x+rad,y,w-2*rad,rad}, bot={x+rad,y+h-rad,w-2*rad,rad};
-    SDL_RenderFillRect(r,&mid); SDL_RenderFillRect(r,&top); SDL_RenderFillRect(r,&bot);
-    fill_circle(r,x+rad,y+rad,rad,c);       fill_circle(r,x+w-rad,y+rad,rad,c);
-    fill_circle(r,x+rad,y+h-rad,rad,c);     fill_circle(r,x+w-rad,y+h-rad,rad,c);
+static void fill_round_rect(Canvas*cv,float x,float y,float w,float h,float rad,Col c){
+    sw_fill_round(cv,x,y,w,h,rad,rad,rad,rad,c);
 }
-
-static void stroke_rect(SDL_Renderer*r,float x,float y,float w,float h,float t,Col c){
-    SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
-    SDL_FRect e[4]={{x,y,w,t},{x,y+h-t,w,t},{x,y,t,h},{x+w-t,y,t,h}};
-    for(int i=0;i<4;i++) SDL_RenderFillRect(r,&e[i]);
+static void stroke_rect(Canvas*cv,float x,float y,float w,float h,float t,Col c){
+    sw_stroke_round(cv,x,y,w,h,0,0,0,0,t,c);
 }
-
-static void fill_tri(SDL_Renderer*r,float x0,float y0,float x1,float y1,float x2,float y2,Col c){
-    SDL_FColor fc=tofc(c);
-    SDL_Vertex v[3]={ {{x0,y0},fc,{0,0}}, {{x1,y1},fc,{0,0}}, {{x2,y2},fc,{0,0}} };
-    int idx[3]={0,1,2};
-    SDL_RenderGeometry(r,NULL,v,3,idx,3);
+static void fill_tri(Canvas*cv,float x0,float y0,float x1,float y1,float x2,float y2,Col c){
+    sw_fill_tri(cv,x0,y0,x1,y1,x2,y2,c);
 }
 /* stacked arrowheads pointing dir (+1 right / -1 left); count grows with speed */
-static void draw_chevrons(SDL_Renderer*r,float x,float y,int dir,float s,int count,Col c){
+static void draw_chevrons(Canvas*cv,float x,float y,int dir,float s,int count,Col c){
     if(count<1)count=1;
     float gap=s*0.72f, total=(count-1)*gap, start=x-dir*total/2;
     for(int i=0;i<count;i++){
         float ax=start+dir*i*gap;
-        fill_tri(r, ax+dir*s*0.5f, y,
-                    ax-dir*s*0.5f, y-s*0.62f,
-                    ax-dir*s*0.5f, y+s*0.62f, c);
+        fill_tri(cv, ax+dir*s*0.5f, y,
+                     ax-dir*s*0.5f, y-s*0.62f,
+                     ax-dir*s*0.5f, y+s*0.62f, c);
     }
 }
 static float norm_ang(float a){ while(a>M_PI)a-=2*M_PI; while(a<=-M_PI)a+=2*M_PI; return a; }
@@ -1253,7 +1168,7 @@ static void dump_config(void){
 "                  # zone, fast toward straight-down.\n"
 "\n"
 "# --- rendering ---\n"
-"ssaa=2            # full-scene supersampling 1..4 (smooths edges). alias: aa\n"
+"ssaa=2            # ignored: every shape is antialiased as it is drawn. alias: aa\n"
 "animate=1         # crossfade app names/icons when results change\n"
 "anim_ms=90        # its duration (0 or animate=0 to turn it off)\n"
 "recent_first=1    # bias the best match toward your recently-used apps\n"
@@ -1392,7 +1307,7 @@ static void usage(const char*a0){
 "  swov=swov           the binary to ask\n"
 "\n"
 "RENDERING\n"
-"  ssaa=2              full-scene supersampling 1..4 (smooths edges; alias: aa)\n"
+"  ssaa=2              ignored; every shape is antialiased as it is drawn (alias: aa)\n"
 "  animate=1 anim_ms=90  crossfade names/icons when results change (0 = off)\n"
 "  width=900 height=900 fullscreen=1  close_on_focus_loss=0\n"
 "\n"
@@ -1416,7 +1331,7 @@ static void usage(const char*a0){
 "EXAMPLES\n"
 "  swas --list                          # discover ids\n"
 "  swas include=firefox,code,gimp       # a curated wheel, in that order\n"
-"  swas exclude=htop sort=alpha ssaa=3  # hide htop, A-Z, extra-smooth\n"
+"  swas exclude=htop sort=alpha         # hide htop, list A-Z\n"
 "  swas ui_scale=1.3 icon_px=56         # bigger text and icons\n"
 "\n"
 "COLORS  (#rrggbb or #rrggbbaa)\n"
@@ -1434,7 +1349,7 @@ static void usage(const char*a0){
 }
 
 /* Load the app/menu list (stdin for dmenu, else scan .desktop dirs). Kept
-   separate so the SDL window can be created first — see main(). */
+   separate so the window can be created first — see main(). */
 static void load_apps(AppList*apps, Config*cfg, int dmenu){
     if(dmenu){                                     /* dmenu mode: items come from stdin */
         char line[8192];
@@ -1519,47 +1434,37 @@ int main(int argc,char**argv){
         return 0;
     }
 
-    /* Identify as swas so the compositor shows the same name everywhere,
-       Wayland app_id / X11 WM_CLASS so float/center rules match. Before init. */
-    SDL_SetAppMetadata(APP_ID,SWAS_VERSION,"org.swas.selector");
-    SDL_SetHint(SDL_HINT_APP_ID,APP_ID);
+    /* A layer-shell surface on the overlay, the size of the output. Not a
+       toplevel window: the compositor puts it above everything including a
+       fullscreen client, it takes the keyboard for as long as it is up, and
+       there is no float/center rule to write. */
+    if(!sw_init()){ fprintf(stderr,"swas: %s\n",sw_error()); return 1; }
 
-    if(!SDL_Init(SDL_INIT_VIDEO)){ fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1; }
-
-    /* "Fullscreen" here means a borderless window the size of the display — a
-       floating overlay, NOT exclusive fullscreen. Exclusive fullscreen makes the
-       surface opaque (black instead of transparent) and causes a mode-switch
-       glitch on close, so we avoid it. */
-    int winw=cfg.width, winh=cfg.height;
-    SDL_Rect dbounds; int have_bounds=0;
+    SwWinOpts wo; memset(&wo,0,sizeof wo);
+    wo.layer          = SW_LAYER_OVERLAY;
+    wo.keyboard       = SW_KBD_EXCLUSIVE;
+    wo.exclusive_zone = -1;
+    wo.namespace_     = APP_ID;
     if(cfg.fullscreen){
-        SDL_DisplayID d=SDL_GetPrimaryDisplay();
-        if(d && SDL_GetDisplayBounds(d,&dbounds)){ winw=dbounds.w; winh=dbounds.h; have_bounds=1; }
+        wo.anchor = SW_ANCHOR_TOP|SW_ANCHOR_BOTTOM|SW_ANCHOR_LEFT|SW_ANCHOR_RIGHT;
+    } else {
+        wo.w = cfg.width; wo.h = cfg.height;
     }
-    SDL_WindowFlags wf=SDL_WINDOW_BORDERLESS|SDL_WINDOW_ALWAYS_ON_TOP;
-    if(cfg.bg.a<255) wf|=SDL_WINDOW_TRANSPARENT;
-    SDL_Window*win=SDL_CreateWindow(APP_ID,winw,winh,wf);
-    if(!win){ fprintf(stderr,"CreateWindow: %s\n",SDL_GetError()); return 1; }
-    if(have_bounds) SDL_SetWindowPosition(win,dbounds.x,dbounds.y);
-    SDL_Renderer*ren=SDL_CreateRenderer(win,NULL);
-    if(!ren){ fprintf(stderr,"CreateRenderer: %s\n",SDL_GetError()); return 1; }
-    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
-    SDL_RaiseWindow(win);
-    SDL_StartTextInput(win);
+    SwApp wapp; memset(&wapp,0,sizeof wapp);      /* we drive our own frames */
+    SwWin *win = sw_win_create(&wo,&wapp);
+    if(!win){ fprintf(stderr,"swas: %s\n",sw_error()); return 1; }
 
-    /* Get the window mapped & focused NOW, before the (possibly slow, on a busy
-       machine) .desktop scan and font load — so keystrokes typed during loading
-       are queued for us by the compositor instead of being lost. */
-    SDL_SetRenderDrawColor(ren,cfg.bg.r,cfg.bg.g,cfg.bg.b,cfg.bg.a);
-    SDL_RenderClear(ren); SDL_RenderPresent(ren);
-    for(int i=0;i<4;i++){ SDL_PumpEvents(); SDL_Delay(1); }
+    /* Get the surface configured NOW, before the (possibly slow, on a busy
+       machine) .desktop scan and font load — so keystrokes typed during
+       loading are queued for us by the compositor instead of being lost. */
+    for(int i=0;i<40 && sw_win_width(win)==0;i++) sw_dispatch(20);
 
     load_apps(&apps,&cfg,dmenu);                    /* slow part; keystrokes queue meanwhile */
 
     if(apps.n==0){ fprintf(stderr,"swas: no %s\n", dmenu?"input on stdin":".desktop applications found");
-                   SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit(); return 1; }
+                   sw_shutdown(); return 1; }
 
-    Font font; memset(&font,0,sizeof font);
+    UiFont font; memset(&font,0,sizeof font);
     char fontpath[PATH_MAX]={0};
     if(*cfg.font){                                   /* explicit: a path OR a family name */
         if(file_exists(cfg.font)) snprintf(fontpath,sizeof fontpath,"%s",cfg.font);
@@ -1568,12 +1473,12 @@ int main(int argc,char**argv){
     if(!*fontpath) fc_match("sans-serif",fontpath,sizeof fontpath);  /* the desktop default */
     if(!*fontpath) try_font_paths(fontpath,sizeof fontpath);         /* last-resort known paths */
     int atlas_px=(int)(cfg.font_px*cfg.ui_scale); if(atlas_px<10)atlas_px=10; if(atlas_px>200)atlas_px=200;
-    if(*fontpath) font_load(&font,ren,fontpath,atlas_px);
-    if(!font.ok) fprintf(stderr,"swas: no usable TTF font found; using built-in font\n");
+    if(*fontpath) font_load(&font,fontpath,atlas_px);
+    if(!font.ok) fprintf(stderr,"swas: no usable TTF font found\n");
 
     int *filt=malloc(apps.n*sizeof*filt); int fn=0; char query[256]={0};
     int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
-    Uint64 anim0=0;                       /* time of last filter change (animation) */
+    uint64_t anim0=0;                       /* time of last filter change (animation) */
     /* Per-slot crossfade bookkeeping: last_* is the layout drawn last frame;
        snap_* is frozen at the moment of a results change. A slot only fades if
        its app+position differ from the snapshot, so anything that stays put
@@ -1584,7 +1489,7 @@ int main(int argc,char**argv){
     #define REBUILD() do{ \
         memcpy(snap_item,last_item,sizeof(int)*last_n); memcpy(snap_ang,last_ang,sizeof(float)*last_n); \
         snap_n=last_n; snap_sel=last_sel; \
-        fn=build_filter(&apps,query,filt,cfg.slots,cfg.recent_first,cfg.center_first,&off,&selslot); anim0=SDL_GetTicks(); }while(0)
+        fn=build_filter(&apps,query,filt,cfg.slots,cfg.recent_first,cfg.center_first,&off,&selslot); anim0=now_ms_(); }while(0)
     REBUILD();
 
     /* --- drag an app out of the wheel and onto a workspace ---
@@ -1595,28 +1500,28 @@ int main(int argc,char**argv){
     float press_x=0, press_y=0;
     float wheel_scale=1.0f;               /* animated 1 -> drop_shrink */
     float corner_t=0.0f;                  /* 0 = centred, 1 = parked in a corner */
-    Uint64 flash_at=0; int flash_ws=-1;   /* the tile that just took an app */
-    SDL_FRect wsp_rect[24];
+    uint64_t flash_at=0; int flash_ws=-1;   /* the tile that just took an app */
+    Rect wsp_rect[24];
 
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
-    Uint64 last_page=0, blink0=SDL_GetTicks();
+    uint64_t last_page=0, blink0=now_ms_();
     int running=1, had_focus=0, page_armed=0, prev_region=0, chose=0;
     int ov_started=0; float ov_lx=-1, ov_ly=-1;
-    /* SDL reports where the pointer already is as soon as the window is up.
-       That is not the user moving it, and it must not throw away the
-       selection we opened with. */
+    /* The compositor reports where the pointer already is as soon as the
+       surface is up. That is not the user moving it, and it must not throw
+       away the selection we opened with. */
     int mouse_live=0; float m0x=0, m0y=0; int mouse_seen=0;
     #define CHOOSE() do{ if(dmenu){ printf("%s\n",apps.v[filt[sel]].name); fflush(stdout); chose=1; } \
                          else launch(&apps.v[filt[sel]],&cfg); running=0; }while(0)
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
-    SDL_Texture*target=NULL; int tw=0,th=0;
     float ui=cfg.ui_scale;
 
     while(running){
-        int w,h; SDL_GetWindowSize(win,&w,&h);
-        int ss=cfg.ssaa;
+        if(!sw_dispatch(0)) break;              /* the compositor went away */
+        int w=sw_win_width(win), h=sw_win_height(win);
+        if(w<=0||h<=0){ sw_dispatch(16); continue; }
 
         {   /* ease the wheel down to its dragging size and place, and back.
                drop_size is a width in pixels, which is what you actually want
@@ -1675,7 +1580,7 @@ int main(int argc,char**argv){
             tile_h=(float)h*0.135f; if(tile_h>190.0f*cfg.ui_scale) tile_h=190.0f*cfg.ui_scale;
             tile_y=(float)h*0.035f;
             for(int i=0;i<NWSP;i++)
-                wsp_rect[i]=(SDL_FRect){ margin+(tw+gap)*(float)i, tile_y, tw, tile_h };
+                wsp_rect[i]=(Rect){ margin+(tw+gap)*(float)i, tile_y, tw, tile_h };
         }
 
         int searching = query[0]!=0;
@@ -1706,10 +1611,10 @@ int main(int argc,char**argv){
                   float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
                   page_speed = maxd>0?clampf(depth/maxd,0,1):0;
                   if(fn>vis){
-                      Uint64 now=SDL_GetTicks();
+                      uint64_t now=now_ms_();
                       float t=page_speed*page_speed;   /* ease in: gentle start, fast finish */
                       int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
-                      if((Sint64)(now-last_page)>=iv){
+                      if((int64_t)(now-last_page)>=iv){
                           off += page_dir;
                           if(off<0)off=0;
                           if(off>maxoff)off=maxoff;
@@ -1720,20 +1625,20 @@ int main(int argc,char**argv){
           }
         }
 
-        if(OV_OUT>=0) ov_poll(win);
+        if(OV_OUT>=0) ov_poll();
 
-        SDL_Event ev;
-        while(SDL_PollEvent(&ev)){
-            if(ev.type==SDL_EVENT_QUIT) running=0;
-            else if(ev.type==SDL_EVENT_WINDOW_FOCUS_GAINED) had_focus=1;
-            else if(ev.type==SDL_EVENT_WINDOW_FOCUS_LOST){
+        SwEvent ev;
+        while(sw_poll(&ev)){
+            if(ev.type==SW_EV_CLOSED) running=0;
+            else if(ev.type==SW_EV_KB_ENTER) had_focus=1;
+            else if(ev.type==SW_EV_KB_LEAVE){
                 /* With the overview up, apps are being started behind us on
                    purpose; each one takes the focus for a moment and that is
                    not a reason to close. */
                 if(cfg.close_on_focus_loss && had_focus && !OV_READY) running=0;
             }
-            else if(ev.type==SDL_EVENT_MOUSE_MOTION){
-                mx=ev.motion.x; my=ev.motion.y;
+            else if(ev.type==SW_EV_MOTION){
+                mx=ev.x; my=ev.y;
 
                 if(!mouse_live){
                     if(!mouse_seen){ mouse_seen=1; m0x=mx; m0y=my; }
@@ -1771,7 +1676,7 @@ int main(int argc,char**argv){
                         drop_ws=-1;
                         if(!over_wheel)
                             for(int i=0;i<NWSP;i++){
-                                SDL_FRect t=wsp_rect[i];
+                                Rect t=wsp_rect[i];
                                 if(mx>=t.x&&mx<t.x+t.w&&my>=t.y&&my<t.y+t.h){ drop_ws=i; break; }
                             }
                     }
@@ -1805,28 +1710,29 @@ int main(int argc,char**argv){
                 else if(region==2 && prev_region==3 && adtop>=icon_dtop) page_armed=1;
                 prev_region=region;
             }
-            else if(ev.type==SDL_EVENT_MOUSE_WHEEL){
-                int dir=ev.wheel.y>0?-1:(ev.wheel.y<0?1:0);
-                if(!dir&&ev.wheel.x)dir=ev.wheel.x>0?1:-1;
+            else if(ev.type==SW_EV_AXIS){
+                /* Wayland scrolls in surface units, positive downward. */
+                int dir=ev.ay<0?-1:(ev.ay>0?1:0);
+                if(!dir&&ev.ax)dir=ev.ax>0?1:-1;
                 if(dir){
                     if(maxoff>0){ off+=dir; if(off<0)off=0; if(off>maxoff)off=maxoff; }
                     else if(vis>0){ selslot+=dir; if(selslot<0)selslot=0; if(selslot>vis-1)selslot=vis-1; }
                 }
             }
-            else if(ev.type==SDL_EVENT_MOUSE_BUTTON_DOWN){
-                if(ev.button.button==SDL_BUTTON_LEFT&&fn){
-                    press_down=1; press_x=ev.button.x; press_y=ev.button.y;
+            else if(ev.type==SW_EV_BUTTON && ev.pressed){
+                if(ev.button==SW_BTN_LEFT&&fn){
+                    press_down=1; press_x=ev.x; press_y=ev.y;
                     /* the bottom zone is for paging; nothing is dragged there */
                     press_item=(prev_region==2||prev_region==3)?-1:filt[sel];
                 }
-                else if(ev.button.button==SDL_BUTTON_RIGHT){
+                else if(ev.button==SW_BTN_RIGHT){
                     if(dragging){ dragging=press_down=0; drop_ws=-1; press_item=-1;
                                   if(OV_READY){ ov_send("drag off"); OV_TARGET[0]='\0'; } }
                     else running=0;
                 }
             }
-            else if(ev.type==SDL_EVENT_MOUSE_BUTTON_UP){
-                if(ev.button.button==SDL_BUTTON_LEFT){
+            else if(ev.type==SW_EV_BUTTON && !ev.pressed){
+                if(ev.button==SW_BTN_LEFT){
                     if(dragging){
                         if(OV_READY){
                             if(over_wheel) OV_TARGET[0]='\0';   /* changed my mind */
@@ -1852,7 +1758,7 @@ int main(int argc,char**argv){
                             pid_t p=launch(&apps.v[press_item],&cfg);
                             wsp_adopt(&cfg,p,&WSP[drop_ws]);
                             WSP[drop_ws].exists=1;      /* it will be there now */
-                            flash_ws=drop_ws; flash_at=SDL_GetTicks();
+                            flash_ws=drop_ws; flash_at=now_ms_();
                             if(WSP[drop_ws].focused && cfg.drop_close_here) running=0;
                         }
                         /* dropped on the wheel, or nowhere: nothing happens */
@@ -1863,27 +1769,30 @@ int main(int argc,char**argv){
                     press_down=0; press_item=-1;
                 }
             }
-            else if(ev.type==SDL_EVENT_TEXT_INPUT){
-                strncat(query,ev.text.text,sizeof query-strlen(query)-1);
-                REBUILD();
-            }
-            else if(ev.type==SDL_EVENT_KEY_DOWN){
-                SDL_Keycode k=ev.key.key;
-                if(k==SDLK_ESCAPE){
+            else if(ev.type==SW_EV_KEY && ev.pressed){
+                uint32_t k=ev.keysym;
+                if(k==SW_KEY_ESCAPE){
                     if(dragging){ dragging=press_down=0; drop_ws=-1; press_item=-1;
                                   if(OV_READY){ ov_send("drag off"); OV_TARGET[0]='\0'; } }
                     else if(query[0]){ query[0]='\0'; REBUILD(); }
                     else running=0;
                 }
-                else if(k==SDLK_RETURN||k==SDLK_KP_ENTER){ if(fn){ CHOOSE(); } }
-                else if(k==SDLK_BACKSPACE){ int L=strlen(query);
+                else if(k==SW_KEY_RETURN||k==SW_KEY_KP_ENTER){ if(fn){ CHOOSE(); } }
+                else if(k==SW_KEY_BACKSPACE){ int L=strlen(query);
                     if(L>0){ L--; while(L>0&&((unsigned char)query[L]&0xC0)==0x80)L--; query[L]='\0'; REBUILD(); } }
-                else if(k==SDLK_RIGHT || (k==SDLK_TAB && !(ev.key.mod&SDL_KMOD_SHIFT))){
+                else if(k==SW_KEY_RIGHT || (k==SW_KEY_TAB && !(ev.mods&SW_MOD_SHIFT))){
                     if(vis>0){ if(selslot<vis-1)selslot++; else if(off<maxoff)off++; } }
-                else if(k==SDLK_LEFT || (k==SDLK_TAB && (ev.key.mod&SDL_KMOD_SHIFT))){
+                else if(k==SW_KEY_LEFT || (k==SW_KEY_TAB && (ev.mods&SW_MOD_SHIFT))){
                     if(vis>0){ if(selslot>0)selslot--; else if(off>0)off--; } }
-                else if(k==SDLK_DOWN){ if(maxoff>0){ off+=vis; if(off>maxoff)off=maxoff; } }
-                else if(k==SDLK_UP){ if(maxoff>0){ off-=vis; if(off<0)off=0; } }
+                else if(k==SW_KEY_DOWN){ if(maxoff>0){ off+=vis; if(off>maxoff)off=maxoff; } }
+                else if(k==SW_KEY_UP){ if(maxoff>0){ off-=vis; if(off<0)off=0; } }
+                /* Anything that types a character types into the query. The
+                   keymap says what that is, so a German keyboard puts ä in
+                   the box when ä is pressed. */
+                else if(ev.text[0] && (unsigned char)ev.text[0]>=0x20){
+                    strncat(query,ev.text,sizeof query-strlen(query)-1);
+                    REBUILD();
+                }
             }
         }
         if(!running) break;
@@ -1902,23 +1811,17 @@ int main(int argc,char**argv){
         if(sel>fn-1)sel=fn-1;
         step = arc/(float)(vis>0?vis:1);
 
-        /* -------------------- render (optionally supersampled) ------------- */
-        if(ss>1){
-            if(!target||tw!=w*ss||th!=h*ss){
-                if(target)SDL_DestroyTexture(target);
-                target=SDL_CreateTexture(ren,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,w*ss,h*ss);
-                if(target){ SDL_SetTextureScaleMode(target,SDL_SCALEMODE_LINEAR);
-                            SDL_SetTextureBlendMode(target,SDL_BLENDMODE_BLEND); tw=w*ss; th=h*ss; }
-            }
-            if(target){ SDL_SetRenderTarget(ren,target); SDL_SetRenderScale(ren,(float)ss,(float)ss); }
-            else ss=1;
-        }
+        /* ------------------------------ render ---------------------------- */
+        /* Every primitive is antialiased as it is drawn — the sectors and
+           triangles sample four times a pixel, the rounded rectangles come
+           from a distance field, the glyphs from stb_truetype — so the old
+           supersampled render target is gone and `ssaa` is ignored. */
+        Canvas *ren = sw_win_begin(win);
+        if(!ren){ sw_dispatch(8); continue; }   /* both buffers still on screen */
 
         /* With swov behind us it draws its own scrim; a second one over the
            top only makes the thing you are aiming at harder to see. */
-        Col clearc = OV_READY ? (Col){0,0,0,0} : cfg.bg;
-        SDL_SetRenderDrawColor(ren,clearc.r,clearc.g,clearc.b,clearc.a);
-        SDL_RenderClear(ren);
+        if(!OV_READY) sw_canvas_fill(ren,cfg.bg);
 
         float slotw=step;
         /* everything inside the wheel is measured against this, so shrinking
@@ -1931,14 +1834,14 @@ int main(int argc,char**argv){
            fade back in while the ring sectors (background) stay put — smooths fast
            typing without delaying anything. */
         float af = (cfg.animate && cfg.anim_ms>0)
-                   ? clampf(0.30f + 0.70f*(float)(SDL_GetTicks()-anim0)/(float)cfg.anim_ms, 0.0f, 1.0f) : 1.0f;
+                   ? clampf(0.30f + 0.70f*(float)(now_ms_()-anim0)/(float)cfg.anim_ms, 0.0f, 1.0f) : 1.0f;
 
         /* Small, over a busy overview, the wheel had nothing to sit on and
            read as a handful of loose marks. A disc behind it gives it an edge
            again — only while it is small, fading in with the shrink. */
         if(corner_t>0.0f && cfg.drop_bg.a){
             Col d=cfg.drop_bg;
-            d.a=(Uint8)(d.a*clampf(corner_t,0.0f,1.0f));
+            d.a=(uint8_t)(d.a*clampf(corner_t,0.0f,1.0f));
             fill_circle(ren,cx,cy,R*1.10f,d);
         }
 
@@ -1953,23 +1856,22 @@ int main(int argc,char**argv){
             /* stationary if this exact app sat at (nearly) this angle before the change */
             int stationary=0;
             for(int k=0;k<snap_n;k++) if(snap_item[k]==item && fabsf(snap_ang[k]-a)<0.02f){ stationary=1; break; }
-            float sfa = stationary?1.0f:af; Uint8 sfab=(Uint8)(255*sfa);
+            float sfa = stationary?1.0f:af; uint8_t sfab=(uint8_t)(255*sfa);
             if(i<SNAPMAX){ last_item[i]=item; last_ang[i]=a; }
 
             float lx=cx+rl*cosf(a), ly=cy+rl*sinf(a);
-            Col tc=hot?cfg.hltext:cfg.text; tc.a=(Uint8)(tc.a*sfa);   /* text fades (unless it held still) */
+            Col tc=hot?cfg.hltext:cfg.text; tc.a=(uint8_t)(tc.a*sfa);   /* text fades (unless it held still) */
             float chord=2*rl*sinf(slotw/2)*0.84f;
             char lbl[160]; fit_label(&font,label_px,apps.v[item].name,chord,lbl,sizeof lbl);
 
-            SDL_Texture*ic=app_icon(ren,&apps.v[item],&cfg);
-            if(ic){
+            Image ic=app_icon(&apps.v[item],&cfg);
+            if(ic.rgba){
                 float isz=cfg.icon_px*uiw; if(isz>chord)isz=chord;
                 float gap=7.0f*uiw;                       /* breathing room */
                 float blockH=isz+gap+label_px;
                 float topy=ly-blockH/2;
-                SDL_FRect dst={lx-isz/2, topy, isz, isz};
-                SDL_SetTextureAlphaMod(ic,sfab);         /* icon fades (unless it held still) */
-                SDL_RenderTexture(ren,ic,NULL,&dst);
+                /* the icon fades with the rest, unless it held still */
+                sw_blit(ren,ic,lx-isz/2,topy,isz,isz,sfab/255.0f);
                 text_centered(ren,&font,lx, topy+isz+gap+label_px/2, label_px, tc, lbl);
             } else {
                 text_centered(ren,&font,lx,ly,label_px,tc,lbl);
@@ -1998,7 +1900,7 @@ int main(int argc,char**argv){
 
         /* center hub */
         fill_circle(ren,cx,cy,rc,cfg.center);
-        Uint64 now=SDL_GetTicks(); int caret=((now-blink0)/500)%2==0;
+        uint64_t now=now_ms_(); int caret=((now-blink0)/500)%2==0;
         char shown[300];
         if(query[0]) snprintf(shown,sizeof shown,"%s%s",query,caret?"|":" ");
         else         snprintf(shown,sizeof shown,"type to search");
@@ -2009,10 +1911,10 @@ int main(int argc,char**argv){
             int sel_item=filt[sel]; last_sel=sel_item;
             float caf = (sel_item==snap_sel)?1.0f:af;      /* same app in the hub -> no fade */
             char nm[200]; fit_label(&font,cfg.title_px*uiw,apps.v[sel_item].name,rc*1.7f,nm,sizeof nm);
-            Col nmc=cfg.text; nmc.a=(Uint8)(nmc.a*caf);
+            Col nmc=cfg.text; nmc.a=(uint8_t)(nmc.a*caf);
             text_centered(ren,&font,cx,cy,cfg.title_px*uiw,nmc,nm);
             char cnt[64]; snprintf(cnt,sizeof cnt,"%d / %d",sel+1,fn);
-            Col cc=cfg.dim; cc.a=(Uint8)(cc.a*caf);
+            Col cc=cfg.dim; cc.a=(uint8_t)(cc.a*caf);
             text_centered(ren,&font,cx,cy+rc*0.40f,cfg.count_px*uiw,cc,cnt);
         } else {
             last_sel=-1;
@@ -2020,19 +1922,19 @@ int main(int argc,char**argv){
         }
 
         /* --- the workspaces, and the app hanging off the pointer --- */
-        if(!OV_READY && (dragging || (flash_ws>=0 && SDL_GetTicks()-flash_at<420))){
+        if(!OV_READY && (dragging || (flash_ws>=0 && now_ms_()-flash_at<420))){
             float rad=10.0f*ui;
             for(int i=0;i<NWSP;i++){
-                SDL_FRect t=wsp_rect[i];
-                int hot=(i==drop_ws), lit=(i==flash_ws && SDL_GetTicks()-flash_at<420);
+                Rect t=wsp_rect[i];
+                int hot=(i==drop_ws), lit=(i==flash_ws && now_ms_()-flash_at<420);
                 Col fill=hot||lit?cfg.hl:(WSP[i].exists?cfg.ring:cfg.bg);
                 if(!WSP[i].exists && !hot && !lit) fill.a=0;
 
                 if(fill.a) fill_round_rect(ren,t.x,t.y,t.w,t.h,rad,fill);
                 if(!WSP[i].exists && !hot && !lit)
-                    stroke_rect(ren,t.x,t.y,t.w,t.h,SDL_max(1.0f,1.5f*ui),cfg.dim);
+                    stroke_rect(ren,t.x,t.y,t.w,t.h,fmaxf(1.0f,1.5f*ui),cfg.dim);
                 else if(WSP[i].focused && !hot && !lit)
-                    stroke_rect(ren,t.x,t.y,t.w,t.h,SDL_max(1.0f,2.0f*ui),cfg.accent);
+                    stroke_rect(ren,t.x,t.y,t.w,t.h,fmaxf(1.0f,2.0f*ui),cfg.accent);
 
                 Col tc = hot||lit ? cfg.hltext : (WSP[i].exists?cfg.text:cfg.dim);
                 char num[16]; snprintf(num,sizeof num,"%d",WSP[i].num);
@@ -2047,14 +1949,13 @@ int main(int argc,char**argv){
         }
         if(over_wheel){                      /* the wheel says: let go here to stop */
             Col o=cfg.dim; o.a=200;
-            ring(ren,cx,cy,R*1.12f,SDL_max(2.0f,2.0f*ui),o);
+            ring(ren,cx,cy,R*1.12f,fmaxf(2.0f,2.0f*ui),o);
         }
         if(dragging && press_item>=0){
             App*a=&apps.v[press_item];
             float isz=cfg.icon_px*ui*1.15f;
-            SDL_Texture*ic=app_icon(ren,a,&cfg);
-            if(ic){ SDL_FRect d={mx-isz/2,my-isz/2,isz,isz};
-                    SDL_SetTextureAlphaMod(ic,235); SDL_RenderTexture(ren,ic,NULL,&d); }
+            Image ic=app_icon(a,&cfg);
+            if(ic.rgba) sw_blit(ren,ic,mx-isz/2,my-isz/2,isz,isz,235/255.0f);
             char cut[160]; fit_label(&font,cfg.label_px*ui,a->name,300.0f*ui,cut,sizeof cut);
             text_centered(ren,&font,mx,my+isz*0.72f,cfg.label_px*ui,cfg.text,cut);
         }
@@ -2064,29 +1965,21 @@ int main(int argc,char**argv){
         if(ERR_TEXT[0] && now_secs_() < ERR_UNTIL){
             float a=(float)(ERR_UNTIL-now_secs_());
             if(a>1.0f) a=1.0f;
-            Col ec=cfg.hl; ec.a=(Uint8)(255*a);
-            Col bgc=cfg.center; bgc.a=(Uint8)(bgc.a*a);
+            Col ec=cfg.hl; ec.a=(uint8_t)(255*a);
+            Col bgc=cfg.center; bgc.a=(uint8_t)(bgc.a*a);
             char cut[200];
             fit_label(&font,cfg.label_px*ui,ERR_TEXT,(float)w*0.7f,cut,sizeof cut);
             float tw=text_width(&font,cfg.label_px*ui,cut);
             float pad=14.0f*ui, bh=cfg.label_px*ui+pad;
-            SDL_FRect box={(float)w*0.5f-tw*0.5f-pad, cy+R+40.0f*ui, tw+2*pad, bh};
-            SDL_SetRenderDrawColor(ren,bgc.r,bgc.g,bgc.b,bgc.a);
-            SDL_RenderFillRect(ren,&box);
-            text_centered(ren,&font,(float)w*0.5f,box.y+bh*0.5f+cfg.label_px*ui*0.35f,
+            sw_fill_rect(ren,(float)w*0.5f-tw*0.5f-pad, cy+R+40.0f*ui, tw+2*pad, bh, bgc);
+            float boxy=cy+R+40.0f*ui;
+            text_centered(ren,&font,(float)w*0.5f,boxy+bh*0.5f+cfg.label_px*ui*0.35f,
                           cfg.label_px*ui,ec,cut);
         } else if(ERR_TEXT[0] && now_secs_() >= ERR_UNTIL) {
             ERR_TEXT[0]=0;
         }
 
-        if(ss>1 && target){
-            SDL_SetRenderScale(ren,1,1);
-            SDL_SetRenderTarget(ren,NULL);
-            SDL_SetRenderDrawColor(ren,0,0,0,0);
-            SDL_RenderClear(ren);
-            SDL_RenderTexture(ren,target,NULL,NULL);     /* fade is per-element now */
-        }
-        SDL_RenderPresent(ren);
+        sw_win_end(win);
 
         if(!ov_started && cfg.drop){
             ov_started=1;             /* only now: the wheel is already up */
@@ -2094,14 +1987,11 @@ int main(int argc,char**argv){
                one up ourselves, if we were asked to */
             if(!ov_adopt() && cfg.overview) ov_spawn(&cfg);
         }
-        SDL_Delay(16);
+        sw_dispatch(16);            /* ~60 fps, and the compositor's events */
     }
     ov_stop();
 
-    if(target)SDL_DestroyTexture(target);
-    SDL_StopTextInput(win);
-    SDL_DestroyRenderer(ren);
-    SDL_DestroyWindow(win);
-    SDL_Quit();
+    sw_fonts_free();
+    sw_shutdown();
     return (dmenu && !chose) ? 1 : 0;   /* dmenu convention: non-zero on cancel */
 }

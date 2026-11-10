@@ -1,17 +1,30 @@
-swas: scale an oversized SVG icon instead of cropping it
+shared: bold faces, offscreen canvases and a PNG writer
 
-Icons were rasterised to the width and height the SVG declares, so anything
-drawn outside that box was simply not drawn. The box is now the declared
-canvas and the shapes' own bounds together: an icon with deliberate padding
-keeps it, one whose art overflows its own width/height is scaled down rather
-than losing an edge. Stroke width is counted in, since a stroke sits astride
-its path.
+What swov needed from the layer that swas and swbr already use, added
+without changing anything the two of them do.
 
-Checked against a 48x48 icon whose art reaches 88x88: ink running into the
-bottom and right edges drops from 54 pixels to 9, and well-formed icons
-rasterise byte for byte as before.
+sw_draw.h
+  - sw_fonts_bold() / sw_font_bold(): a second face for headings. Without
+    one the regular face is emboldened by drawing each glyph twice, a
+    third of a pixel apart, so bold still reads as bold on a desktop that
+    ships only one weight. The cache is keyed on size and weight together.
+  - sw_canvas_new/free/clear and sw_blit_canvas(): an offscreen canvas
+    that can be scaled, tinted and faded onto another. Shrinking box-
+    filters; a 1:1 aligned blit is a straight premultiplied-over copy.
+    This is what swov's backdrop fade and its full -> half -> small blur
+    chain are made of.
+  - sw_write_png(): one canvas to a PNG, stored (uncompressed) deflate,
+    for swov --shot. No zlib, a big file, which is fine for one frame.
+  - sw_text_width_n() and sw_font_descent(), for measuring part of a
+    string and centring a line in a box.
 
-Also in this release: dmenu's own flags (-l N, -p PROMPT, -i, ...) now switch
-on dmenu mode and are otherwise ignored, so MENU=swas works unchanged in
-scripts written for dmenu or bemenu. Blank lines in the input are skipped
-rather than becoming empty slices on the wheel.
+sw_wl.h
+  - SwEvent.code carries the raw evdev keycode, so a program can read a
+    key by its place on the board rather than by what it types. swov's
+    number row needs that on a layout where the digits take shift.
+  - sw_win_create() accepts a NULL SwApp: a program that drives its own
+    frames with sw_win_begin/end has no callbacks to give, and passing
+    NULL used to dereference it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SuAfijAAYjLpcVwhCq3AF4
