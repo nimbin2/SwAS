@@ -53,7 +53,9 @@ typedef struct {
     bool     ok;
 } SwKeymap;
 
-/* Parse what arrived on wl_keyboard.keymap. Safe to call again on a change. */
+/* Parse what arrived on wl_keyboard.keymap. Safe to call again on a change.
+ * A keymap this cannot read is not fatal: any keycode it has nothing for
+ * falls back to a built-in US layout, so the program still takes input. */
 bool     sw_keymap_parse(SwKeymap *km, const char *text, size_t len);
 
 /* The keysym for a keycode under the current modifiers, and what it types.
@@ -966,18 +968,82 @@ unsigned sw_keymap_mods(const SwKeymap *km, uint32_t depressed)
     return m;
 }
 
+/* A plain US layout by evdev code, used for any key the parsed keymap has
+ * nothing for — and for every key if the keymap could not be read at all.
+ * It is not meant to be right for a German or French board; it is there so a
+ * keymap this parser chokes on costs the user their layout, not their
+ * keyboard. Index is the evdev code (xkb keycode minus 8); the two entries
+ * are the plain and the shifted keysym. */
+typedef struct { uint16_t code; uint32_t plain, shift; } SwKcDefault;
+static const SwKcDefault SWK_US[] = {
+    {  1, SW_KEY_ESCAPE, SW_KEY_ESCAPE },
+    {  2, '1', '!' }, {  3, '2', '@' }, {  4, '3', '#' }, {  5, '4', '$' },
+    {  6, '5', '%' }, {  7, '6', '^' }, {  8, '7', '&' }, {  9, '8', '*' },
+    { 10, '9', '(' }, { 11, '0', ')' }, { 12, '-', '_' }, { 13, '=', '+' },
+    { 14, SW_KEY_BACKSPACE, SW_KEY_BACKSPACE }, { 15, SW_KEY_TAB, 0xfe20 },
+    { 16, 'q', 'Q' }, { 17, 'w', 'W' }, { 18, 'e', 'E' }, { 19, 'r', 'R' },
+    { 20, 't', 'T' }, { 21, 'y', 'Y' }, { 22, 'u', 'U' }, { 23, 'i', 'I' },
+    { 24, 'o', 'O' }, { 25, 'p', 'P' }, { 26, '[', '{' }, { 27, ']', '}' },
+    { 28, SW_KEY_RETURN, SW_KEY_RETURN },
+    { 30, 'a', 'A' }, { 31, 's', 'S' }, { 32, 'd', 'D' }, { 33, 'f', 'F' },
+    { 34, 'g', 'G' }, { 35, 'h', 'H' }, { 36, 'j', 'J' }, { 37, 'k', 'K' },
+    { 38, 'l', 'L' }, { 39, ';', ':' }, { 40, '\'', '"' }, { 41, '`', '~' },
+    { 43, '\\', '|' },
+    { 44, 'z', 'Z' }, { 45, 'x', 'X' }, { 46, 'c', 'C' }, { 47, 'v', 'V' },
+    { 48, 'b', 'B' }, { 49, 'n', 'N' }, { 50, 'm', 'M' }, { 51, ',', '<' },
+    { 52, '.', '>' }, { 53, '/', '?' }, { 55, '*', '*' },
+    { 57, ' ', ' ' },
+    { 59, 0xffbe, 0xffbe }, { 60, 0xffbf, 0xffbf }, { 61, 0xffc0, 0xffc0 },
+    { 62, 0xffc1, 0xffc1 }, { 63, 0xffc2, 0xffc2 }, { 64, 0xffc3, 0xffc3 },
+    { 65, 0xffc4, 0xffc4 }, { 66, 0xffc5, 0xffc5 }, { 67, 0xffc6, 0xffc6 },
+    { 68, 0xffc7, 0xffc7 }, { 87, 0xffc8, 0xffc8 }, { 88, 0xffc9, 0xffc9 },
+    { 71, 0xffb7, 0xff95 }, { 72, 0xffb8, 0xff97 }, { 73, 0xffb9, 0xff9a },
+    { 74, '-', '-' },
+    { 75, 0xffb4, 0xff96 }, { 76, 0xffb5, 0xff9d }, { 77, 0xffb6, 0xff98 },
+    { 78, '+', '+' },
+    { 79, 0xffb1, 0xff9c }, { 80, 0xffb2, 0xff99 }, { 81, 0xffb3, 0xff9b },
+    { 82, 0xffb0, 0xff9e }, { 83, 0xffae, 0xff9f },
+    { 96, SW_KEY_KP_ENTER, SW_KEY_KP_ENTER }, { 98, '/', '/' },
+    { 102, SW_KEY_HOME, SW_KEY_HOME }, { 103, SW_KEY_UP, SW_KEY_UP },
+    { 104, SW_KEY_PAGE_UP, SW_KEY_PAGE_UP }, { 105, SW_KEY_LEFT, SW_KEY_LEFT },
+    { 106, SW_KEY_RIGHT, SW_KEY_RIGHT }, { 107, SW_KEY_END, SW_KEY_END },
+    { 108, SW_KEY_DOWN, SW_KEY_DOWN }, { 109, SW_KEY_PAGE_DOWN, SW_KEY_PAGE_DOWN },
+    { 110, SW_KEY_INSERT, SW_KEY_INSERT }, { 111, SW_KEY_DELETE, SW_KEY_DELETE }
+};
+
+static uint32_t swk_default_sym(uint32_t keycode, bool shift)
+{
+    uint32_t ev;
+    size_t i;
+    if (keycode < 8) return 0;
+    ev = keycode - 8;
+    for (i = 0; i < sizeof(SWK_US) / sizeof(SWK_US[0]); ++i)
+        if (SWK_US[i].code == ev) return shift ? SWK_US[i].shift : SWK_US[i].plain;
+    return 0;
+}
+
 uint32_t sw_keymap_lookup(const SwKeymap *km, uint32_t keycode, unsigned mods,
                           char *utf8, size_t n)
 {
-    if (utf8 && n) utf8[0] = 0;
-    if (!km || !km->ok || keycode >= SW_KEYMAP_MAX) return 0;
-
     bool shift = (mods & 1u) != 0, altgr = (mods & 16u) != 0, caps = (mods & 32u) != 0;
-    int level = km->keypad[keycode] ? ((mods & 64u) ? 1 : 0)
-                                    : ((shift ? 1 : 0) + (altgr ? 2 : 0));
-    uint32_t sym = km->sym[keycode][level];
+    uint32_t sym;
+    int level;
+
+    if (utf8 && n) utf8[0] = 0;
+    if (keycode >= SW_KEYMAP_MAX) return 0;
+
+    if (!km || !km->ok) {                  /* nothing parsed: the built-in one */
+        sym = swk_default_sym(keycode, shift);
+        if (utf8 && n && !(mods & 2u)) swk_utf8(sw_keysym_to_codepoint(sym), utf8, n);
+        return sym;
+    }
+
+    level = km->keypad[keycode] ? ((mods & 64u) ? 1 : 0)
+                                : ((shift ? 1 : 0) + (altgr ? 2 : 0));
+    sym = km->sym[keycode][level];
     if (!sym && level) sym = km->sym[keycode][level & 1];
     if (!sym) sym = km->sym[keycode][0];
+    if (!sym) sym = swk_default_sym(keycode, shift);   /* a key it had nothing for */
 
     /* Caps lock is shift, but only for letters — it must not turn 1 into !. */
     if (caps && !shift) {

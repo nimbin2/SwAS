@@ -782,15 +782,47 @@ static const struct wl_pointer_listener sw_ptr_listener = {
 static SwKeymap SW_KEYMAP;
 static unsigned SW_MODS;
 
+/* SW_DEBUG_KEYS=1 in the environment narrates the keyboard to stderr: what
+   keymap arrived and whether it could be read, when the surface gains and
+   loses the keyboard, and every key with its code, keysym and character.
+   One run of that says which of those is missing. */
+static int sw_dbg_keys(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SW_DEBUG_KEYS");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on;
+}
+
 static void sw_kbd_keymap(void *d, struct wl_keyboard *k, uint32_t format,
                           int32_t fd, uint32_t size)
 {
     (void)d; (void)k;
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) { close(fd); return; }
-    char *text = (char *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (text != MAP_FAILED) {
-        sw_keymap_parse(&SW_KEYMAP, text, size);
-        munmap(text, size);
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        if (sw_dbg_keys())
+            fprintf(stderr, "sw: keymap in format %u, not xkb — using the built-in one\n",
+                    format);
+        close(fd);
+        return;
+    }
+    {
+        char *text = (char *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (text == MAP_FAILED) {
+            if (sw_dbg_keys())
+                fprintf(stderr, "sw: cannot map the %u-byte keymap (%s) — using the built-in one\n",
+                        size, strerror(errno));
+        } else {
+            bool ok = sw_keymap_parse(&SW_KEYMAP, text, size);
+            if (sw_dbg_keys()) {
+                int keys = 0, i;
+                for (i = 0; i < SW_KEYMAP_MAX; ++i) if (SW_KEYMAP.sym[i][0]) keys++;
+                fprintf(stderr, "sw: keymap %u bytes, parsed %s, %d keys\n",
+                        size, ok ? "ok" : "FAILED", keys);
+            }
+            munmap(text, size);
+        }
     }
     close(fd);
 }
@@ -801,6 +833,8 @@ static void sw_kbd_enter(void *d, struct wl_keyboard *k, uint32_t serial,
     (void)d; (void)k; (void)serial; (void)keys;
     SW_KBD_WIN = sw_win_of(s);
     SwEvent e = { .type = SW_EV_KB_ENTER };
+    if (sw_dbg_keys())
+        fprintf(stderr, "sw: keyboard enter%s\n", SW_KBD_WIN ? "" : " (not our surface)");
     sw_push(&e);
 }
 
@@ -810,6 +844,7 @@ static void sw_kbd_leave(void *d, struct wl_keyboard *k, uint32_t serial,
     (void)d; (void)k; (void)serial;
     SwWin *w = sw_win_of(s);
     SwEvent e = { .type = SW_EV_KB_LEAVE };
+    if (sw_dbg_keys()) fprintf(stderr, "sw: keyboard leave\n");
     sw_push(&e);
     if (w && w->app.keyboard_leave) w->app.keyboard_leave(w->app.user);
     if (SW_KBD_WIN == w) SW_KBD_WIN = NULL;
@@ -825,6 +860,9 @@ static void sw_kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
     SwEvent e = { .type = SW_EV_KEY, .keysym = sym, .code = key, .mods = SW_MODS,
                   .pressed = state != 0 };
     memcpy(e.text, utf8, sizeof(e.text));
+    if (sw_dbg_keys())
+        fprintf(stderr, "sw: key %s code %u sym 0x%04x mods 0x%02x text '%s'\n",
+                state ? "down" : "up  ", key, sym, SW_MODS, utf8);
     sw_push(&e);
     if (!w || !w->app.key) return;
     w->app.key(w->app.user, sym, utf8, SW_MODS, state != 0);

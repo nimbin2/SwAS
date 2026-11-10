@@ -23,11 +23,14 @@ PREFIX      ?= /usr
 bindir      ?= $(PREFIX)/bin
 datadir     ?= $(PREFIX)/share/swas
 
-BUILD       := $(shell md5sum swas.c 2>/dev/null | cut -c1-8)
 SRC         := swas.c
 BIN         := swas
 HDRS        := stb_truetype.h stb_image.h nanosvg.h nanosvgrast.h \
                sw_theme.h sw_draw.h sw_wl.h sw_keymap.h
+
+# the build id covers the headers too: a fix in the shared drawing layer is
+# a different build even when swas.c has not moved
+BUILD       := $(shell cat $(SRC) $(HDRS) 2>/dev/null | md5sum | cut -c1-8)
 
 WL_CFLAGS   := $(shell $(PKG_CONFIG) --cflags wayland-client 2>/dev/null)
 WL_LIBS     := $(shell $(PKG_CONFIG) --libs wayland-client 2>/dev/null || echo -lwayland-client)

@@ -243,6 +243,11 @@ that.
   windows underneath exactly as they were.
 - Keyboard layout comes from the compositor's own keymap, so dead keys, AltGr
   and non-US layouts type correctly. There is no `libxkbcommon` to install.
+  A keymap it cannot read costs you your layout, not your keyboard: those
+  keys fall back to a built-in US one.
+- If a key does nothing, run it from a terminal with `SW_DEBUG_KEYS=1`. It
+  prints the keymap it was given and whether it could be read, when it gains
+  and loses the keyboard, and every key with its code, keysym and character.
 - `ssaa` is accepted and ignored. Every shape is antialiased as it is drawn,
   so there is nothing left to supersample.
 - Apps whose `.desktop` file says `Terminal=true` are run inside `terminal=`.
